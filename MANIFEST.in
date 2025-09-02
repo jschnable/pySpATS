@@ -1,0 +1,6 @@
+include README.md
+include requirements.txt
+recursive-include pyspats *.py
+recursive-include tests *.py *.sh
+recursive-include docs *.md *.rst
+recursive-include examples *.py *.md
