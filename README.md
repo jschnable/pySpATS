@@ -40,15 +40,6 @@ Here's what pySpATS can do with your field trial data, demonstrated using a real
 - **Top/Bottom Genotypes**: Best and worst performers
 - **Variance Components**: Heritability visualization (h² = 0.813)
 
-### Spatial Correlation Analysis  
-
-![pySpATS Variogram Analysis](examples/pyspats_sorghum_variogram.png)
-
-**Variogram plots revealing:**
-- **Empirical Variogram**: Spatial correlation structure
-- **Distance Relationships**: How correlation changes with distance
-- **Field Patterns**: Understanding spatial dependencies
-
 ### 🔬 Multi-Trait Results Summary
 
 | Trait | Observations | Genotypes | Heritability | Interpretation |
@@ -245,3 +236,4 @@ This package is released under the GPL-2 License. See LICENSE file for details.
 
 
 **⭐ Star this repository if you find it useful!**
+
