@@ -19,12 +19,24 @@ While we have sought to verify that this Python implementation produces equivale
 pySpATS provides spatial analysis of field trials using P-splines, allowing researchers to:
 
 - **Correct for spatial heterogeneity** in agricultural field experiments
-- **Extract genotypic BLUEs** (Best Linear Unbiased Estimates) 
+- **Extract genotypic BLUEs** (Best Linear Unbiased Estimates)
 - **Calculate heritability estimates** for quantitative traits
 - **Visualize spatial patterns** and model diagnostics
 - **Handle complex experimental designs** with multiple factors
 
 This implementation is designed to integrate seamlessly with the Python data science ecosystem while maintaining statistical equivalence with the original R package.
+
+### PS-ANOVA Spatial Decomposition
+
+pySpATS uses **PS-ANOVA** (Penalized Spline ANOVA) decomposition for spatial modeling:
+
+- **Fixed polynomial part**: Intercept + linear row + linear column trends
+- **Random smooth parts**: Row-smooth (f_r), column-smooth (f_c), and interaction (f_rc)
+- **2nd-order P-spline penalties**: Control smoothness via difference penalties
+- **Orthogonality**: Random smooths are orthogonal to polynomial space (no leakage)
+- **Whitening**: Penalties absorbed so each random block has G_k = σ_k² I
+
+This ensures clean variance decomposition and accurate effective dimension (ED) computation for heritability estimation, matching the R SpATS implementation.
 
 ## Visual Example: Real Sorghum Field Trial Analysis
 
@@ -112,7 +124,26 @@ model.plot_spatial()  # Spatial trend visualization
 blues.to_csv('genotype_blues.csv')
 ```
 
-> 💡 **Try the full example**: Run `python examples/pyspats_sorghum_example.py` to see pySpATS in action with real sorghum trial data.
+> 💡 **Try the full example**: Run `python examples/pyspats_sorghum_example.py` to see pySpATS in action with real sorghum trial data!
+
+## Key Features
+
+### 🎯 **Accurate Statistical Analysis**
+- **PS-ANOVA decomposition**: Explicit polynomial fixed effects (intercept, linear row/col) + orthogonal P-spline random smooths
+- Spatially corrected genotype estimates with proper variance partitioning
+- Proper mixed model framework with exact effective dimension computation
+- Validated against R SpATS implementation
+
+### 🛡️ **Robust Data Handling**
+- Automatic detection of problematic covariates
+- Intelligent missing data handling
+- Informative warnings and error messages
+
+### 📊 **Rich Visualization**
+- **6-panel diagnostic suite** (see example plots above)
+- **Spatial residual mapping** for field pattern detection
+- **Variogram analysis** for spatial correlation assessment
+- **Publication-ready plots** with customizable styling
 
 ### 🐍 **Python Integration**
 - Pandas DataFrame input/output

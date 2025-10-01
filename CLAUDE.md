@@ -57,11 +57,15 @@ The SpATS model fitting follows this sequence:
 
 1. **Input Validation** (`core.py:_validate_inputs`): Checks for missing columns, validates spatial coordinates, ensures categorical variables are properly typed
 2. **Data Preparation** (`core.py:_prepare_data`): Handles missing values, converts categorical variables, removes problematic factors with insufficient levels
-3. **Design Matrix Construction** (`basis.py:construct_design_matrix`): Builds fixed effects (X) and random effects (Z) design matrices
-4. **Spatial Basis Construction** (`basis.py:construct_2d_pspline`): Creates 2D P-spline basis using tensor products of 1D B-splines
-5. **Model Fitting** (`solver.py:SAP_solver`): Uses SAP (Separation of Anisotropic Penalties) algorithm to estimate coefficients and variance components
+3. **Design Matrix Construction** (`core.py:_construct_design_matrices`):
+   - Uses PS-ANOVA decomposition via `psanova_basis.build_psanova_design()`
+   - Creates fixed polynomial: X_poly = [1, r_norm, c_norm]
+   - Creates orthogonal random smooths: Z_r, Z_c, Z_rc (nullspace-free, whitened)
+   - Builds BlockInfo metadata for each random block
+4. **Model Fitting** (`solver.py:SAP_solver`): Uses SAP algorithm to estimate coefficients and variance components with G_k = σ_k² I
+5. **Effective Dimension** (`ed_selected_inverse.py`): Exact ED computation using CHOLMOD sparse Cholesky selected inverse
 6. **BLUE Extraction** (`core.py:get_BLUEs`): Computes genotype Best Linear Unbiased Estimates
-7. **Heritability Calculation** (`core.py:heritability`): Estimates broad-sense heritability from variance components
+7. **Heritability Calculation** (`utils.py:get_heritability`): Estimates broad-sense heritability H² = ED_geno / n_geno (generalized) or ED_geno / (n_geno - 1) (classical)
 
 ### Key Components
 
@@ -77,6 +81,15 @@ The SpATS model fitting follows this sequence:
 - `construct_2d_pspline()`: Creates 2D tensor product basis for spatial surface
 - `construct_design_matrix()`: Builds design matrices for fixed and random effects
 - Penalty matrix construction for P-spline smoothing
+
+**`pyspats/psanova_basis.py`**: PS-ANOVA decomposition for spatial modeling
+- `build_psanova_design()`: Main function creating PS-ANOVA spatial decomposition
+- **Fixed polynomial part**: X_poly = [1, r_norm, c_norm] (intercept + linear row/col)
+- **Random smooth parts**: Z_r (row-smooth), Z_c (col-smooth), Z_rc (interaction)
+- `remove_nullspace_and_whiten()`: Removes penalty nullspace and absorbs penalty via whitening
+- `project_out_polynomial()`: Ensures orthogonality between random smooths and polynomial space
+- **Key property**: All random blocks have G_k = σ_k² I after whitening
+- Returns BlockInfo metadata for contiguous random blocks (required for exact ED computation)
 
 **`pyspats/solver.py`**: SAP algorithm implementation
 - `SAP_solver.solve()`: Iteratively estimates coefficients and variance components
@@ -125,20 +138,63 @@ SpATS.__init__() validates inputs
     ↓
 _prepare_data() cleans and structures data
     ↓
-construct_design_matrix() creates X (fixed) and Z (random) matrices
-    ↓
-construct_2d_pspline() creates spatial basis
+_construct_design_matrices() creates X and Z using PS-ANOVA
+    ├── build_psanova_design() for spatial decomposition
+    │   ├── Fixed: X_poly = [1, r, c]
+    │   └── Random: Z_r, Z_c, Z_rc (orthogonal, whitened)
+    ├── Add genotype effects (fixed or random)
+    └── Add other fixed/random effects
     ↓
 SAP_solver.solve() iteratively estimates parameters
+    ├── Mixed model equations with G_k = σ_k² I
+    └── Convergence based on variance components
     ↓
 Fitted model with coefficients, variance components
     ↓
+ed_components_from_selected_inverse() computes exact EDs
+    ↓
 get_BLUEs() extracts genotype estimates
+    ↓
+get_heritability() computes H² = ED_geno / n_geno
     ↓
 plot() generates diagnostics
 ```
 
 ## Important Implementation Details
+
+### PS-ANOVA Spatial Decomposition
+
+The spatial surface is modeled using **PS-ANOVA** (Penalized Spline ANOVA) decomposition:
+
+**Mathematical Model:**
+```
+f(r, c) = β₀ + β_r·r + β_c·c + f_r(r) + f_c(c) + f_rc(r, c)
+```
+
+Where:
+- **Fixed polynomial**: β₀ (intercept), β_r·r (linear row trend), β_c·c (linear column trend)
+- **Random smooths**: f_r (row-smooth), f_c (col-smooth), f_rc (interaction smooth)
+
+**Implementation Steps** (in `psanova_basis.py`):
+
+1. **Build B-spline bases**: Construct B_r (row) and B_c (column) bases with 2nd-order penalties K_r, K_c
+2. **Nullspace removal**: Remove constant/linear nullspace from penalties via eigendecomposition
+3. **Whitening**: Transform Z̃_k = Z_k @ U_+ @ Λ_+^{1/2} so penalty becomes G_k = σ_k² I
+4. **Orthogonalization**: Project out polynomial space from all random blocks
+5. **BlockInfo metadata**: Create contiguous block labels for ED computation
+
+**Key Properties:**
+- ✅ Random smooths orthogonal to polynomial space: X_poly^T @ Z̃_k ≈ 0
+- ✅ Nullspace-free: No constant/linear leakage in random parts
+- ✅ Identity covariance: Each random block has G_k = σ_k² I
+- ✅ Contiguous blocks: Clean variance partitioning for exact ED
+
+**Validation** (in `tests/test_psanova_hygiene.py`):
+- Orthogonality checks: |X_poly^T @ Z̃_k| < 1e-8
+- Nullspace removal: Dimensionality reduction by 2 (constant + linear)
+- Block structure: Contiguous, non-overlapping indices
+
+This matches the R SpATS implementation and ensures accurate heritability estimation.
 
 ### Genotype Handling
 - Genotypes can be treated as **fixed effects** (default, `genotype_as_random=False`) or **random effects** (`genotype_as_random=True`)

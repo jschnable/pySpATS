@@ -15,8 +15,10 @@ from .control import SpATSControl
 from .basis import construct_2d_pspline, construct_design_matrix
 from .families import Family, gaussian
 from .solver import SAP_solver
-from .utils import interpret_formula
+from .utils import interpret_formula, get_heritability
 from . import plotting
+from .psanova_basis import build_psanova_design
+from .ed_selected_inverse import BlockInfo
 
 
 class SpATS:
@@ -321,12 +323,35 @@ class SpATS:
         self._store_results(design_info, beta, u, lambda_params, mu, deviance, iteration + 1)
         
     def _construct_design_matrices(self) -> Dict[str, Any]:
-        """Construct design matrices for fixed and random effects."""
+        """Construct design matrices for fixed and random effects using PS-ANOVA decomposition."""
         valid_data = self.data[self.valid_obs]
 
-        # Fixed effects design matrix
-        X_parts = []
+        # PS-ANOVA decomposition for spatial component
+        # Fixed polynomial: [1, r, c]
+        # Random smooths: row-smooth, col-smooth, interaction (orthogonal to polynomial)
+        spatial_blocks = []
         n_geno_fixed = None
+        n_geno_random = None
+
+        if isinstance(self.spatial, tuple):
+            x_coord, y_coord = self.spatial
+            r_vals = valid_data[x_coord].values
+            c_vals = valid_data[y_coord].values
+
+            # Build PS-ANOVA design with explicit polynomial fixed effects
+            # and orthogonal random smooths
+            X_poly, Z_r, Z_c, Z_rc, spatial_blocks = build_psanova_design(
+                r_vals, c_vals,
+                nkr=10,  # Default knots for row
+                nkc=10,  # Default knots for column
+                degree=3
+            )
+
+            # Fixed effects: start with polynomial part
+            X_parts = [X_poly]
+        else:
+            # No spatial component - just intercept
+            X_parts = [np.ones((len(valid_data), 1))]
 
         # Genotype (if fixed)
         if not self.genotype_as_random:
@@ -343,32 +368,29 @@ class SpATS:
             else:
                 X_parts.append(valid_data[var].values.reshape(-1, 1))
 
-        # Add intercept
-        X_parts.insert(0, np.ones((len(valid_data), 1)))
         X = np.hstack(X_parts) if X_parts else np.ones((len(valid_data), 1))
 
         # Random effects design matrix
         Z_parts = []
         penalty_matrices = []
-        n_geno_random = None
+        block_info = []  # Track block metadata for ED computation
 
-        # Spatial component (2D P-splines)
+        # Add spatial random smooths (already whitened, so penalty = identity)
         if isinstance(self.spatial, tuple):
-            x_coord, y_coord = self.spatial
-            x_vals = valid_data[x_coord].values
-            y_vals = valid_data[y_coord].values
-
-            spatial_basis, spatial_penalty = construct_2d_pspline(
-                x_vals, y_vals,
-                nseg=(10, 10),  # Default segments
-                degree=3,       # Default degree
-                penalty_order=2 # Default penalty order
-            )
-            Z_parts.append(spatial_basis)
-            # For 2D P-splines, we have multiple penalties for the same basis
-            # Store as a single combined penalty
-            combined_spatial_penalty = sum(spatial_penalty)  # Sum the penalties
-            penalty_matrices.append(combined_spatial_penalty)
+            current_idx = 0
+            for Z_block, block in zip([Z_r, Z_c, Z_rc], spatial_blocks):
+                if Z_block.shape[1] > 0:
+                    Z_parts.append(Z_block)
+                    # Penalty is identity (already whitened)
+                    penalty_matrices.append(sparse.eye(Z_block.shape[1]))
+                    # Update block indices to account for global position
+                    block_info.append(BlockInfo(
+                        name=block.name,
+                        start=current_idx,
+                        stop=current_idx + Z_block.shape[1],
+                        is_random=True
+                    ))
+                    current_idx += Z_block.shape[1]
 
         # Genotype (if random)
         if self.genotype_as_random:
@@ -377,13 +399,28 @@ class SpATS:
             # Add identity penalty for genotype random effects
             n_geno_random = geno_dummies.shape[1]
             penalty_matrices.append(sparse.eye(n_geno_random))
+            block_info.append(BlockInfo(
+                name='genotype',
+                start=current_idx,
+                stop=current_idx + n_geno_random,
+                is_random=True
+            ))
+            current_idx += n_geno_random
 
         # Other random effects
         for var in self.random:
             dummies = pd.get_dummies(valid_data[var], drop_first=False)
+            n_levels = dummies.shape[1]
             Z_parts.append(dummies.values)
             # Add identity penalty
-            penalty_matrices.append(sparse.eye(dummies.shape[1]))
+            penalty_matrices.append(sparse.eye(n_levels))
+            block_info.append(BlockInfo(
+                name=var,
+                start=current_idx,
+                stop=current_idx + n_levels,
+                is_random=True
+            ))
+            current_idx += n_levels
 
         Z = np.hstack(Z_parts) if Z_parts else np.zeros((len(valid_data), 0))
 
@@ -391,6 +428,7 @@ class SpATS:
             'X': X,
             'Z': Z,
             'penalty_matrices': penalty_matrices,
+            'block_info': block_info,  # Add block metadata
             'valid_data': valid_data,
             'n_geno_fixed': n_geno_fixed,
             'n_geno_random': n_geno_random
