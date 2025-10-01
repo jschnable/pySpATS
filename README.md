@@ -141,13 +141,21 @@ model = SpATS(
 ```python
 # Genotypic BLUEs
 blues = model.get_BLUEs()
+
+# Heritability (generalized method: H² = ED_geno / n_geno)
 print(f"Heritability: {model.heritability:.3f}")
 
-# Model diagnostics  
+# For classical heritability (H² = ED_geno / (n_geno - 1))
+h2_classical = model.get_heritability(mode='classical')
+print(f"Classical heritability: {h2_classical:.3f}")
+
+# Model diagnostics
 print(f"Deviance: {model.deviance:.1f}")
 print(f"Effective dimensions: {model.effective_dims}")
 print(f"Observations: {model.n_obs}")
 ```
+
+**Note on Heritability**: Default heritability follows SpATS generalized H² = ED_geno / n_geno. For comparison with older results, set `mode='classical'` to compute ED_geno / (n_geno - 1).
 
 ### Visualization Options
 

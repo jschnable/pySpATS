@@ -323,15 +323,18 @@ class SpATS:
     def _construct_design_matrices(self) -> Dict[str, Any]:
         """Construct design matrices for fixed and random effects."""
         valid_data = self.data[self.valid_obs]
-        
+
         # Fixed effects design matrix
         X_parts = []
-        
+        n_geno_fixed = None
+
         # Genotype (if fixed)
         if not self.genotype_as_random:
             geno_dummies = pd.get_dummies(valid_data[self.genotype], drop_first=True)
             X_parts.append(geno_dummies.values)
-            
+            # Track number of genotypes (including baseline)
+            n_geno_fixed = valid_data[self.genotype].nunique()
+
         # Other fixed effects
         for var in self.fixed:
             if valid_data[var].dtype in ['object', 'category']:
@@ -339,23 +342,24 @@ class SpATS:
                 X_parts.append(dummies.values)
             else:
                 X_parts.append(valid_data[var].values.reshape(-1, 1))
-                
+
         # Add intercept
         X_parts.insert(0, np.ones((len(valid_data), 1)))
         X = np.hstack(X_parts) if X_parts else np.ones((len(valid_data), 1))
-        
+
         # Random effects design matrix
         Z_parts = []
         penalty_matrices = []
-        
+        n_geno_random = None
+
         # Spatial component (2D P-splines)
         if isinstance(self.spatial, tuple):
             x_coord, y_coord = self.spatial
             x_vals = valid_data[x_coord].values
             y_vals = valid_data[y_coord].values
-            
+
             spatial_basis, spatial_penalty = construct_2d_pspline(
-                x_vals, y_vals, 
+                x_vals, y_vals,
                 nseg=(10, 10),  # Default segments
                 degree=3,       # Default degree
                 penalty_order=2 # Default penalty order
@@ -365,29 +369,31 @@ class SpATS:
             # Store as a single combined penalty
             combined_spatial_penalty = sum(spatial_penalty)  # Sum the penalties
             penalty_matrices.append(combined_spatial_penalty)
-            
+
         # Genotype (if random)
         if self.genotype_as_random:
             geno_dummies = pd.get_dummies(valid_data[self.genotype], drop_first=False)
             Z_parts.append(geno_dummies.values)
             # Add identity penalty for genotype random effects
-            n_geno = geno_dummies.shape[1]
-            penalty_matrices.append(sparse.eye(n_geno))
-            
+            n_geno_random = geno_dummies.shape[1]
+            penalty_matrices.append(sparse.eye(n_geno_random))
+
         # Other random effects
         for var in self.random:
             dummies = pd.get_dummies(valid_data[var], drop_first=False)
             Z_parts.append(dummies.values)
             # Add identity penalty
             penalty_matrices.append(sparse.eye(dummies.shape[1]))
-            
+
         Z = np.hstack(Z_parts) if Z_parts else np.zeros((len(valid_data), 0))
-        
+
         return {
             'X': X,
             'Z': Z,
             'penalty_matrices': penalty_matrices,
-            'valid_data': valid_data
+            'valid_data': valid_data,
+            'n_geno_fixed': n_geno_fixed,
+            'n_geno_random': n_geno_random
         }
     
     def _solve_mixed_model_equations(self, design_info, z, w, lambda_params):
@@ -512,38 +518,50 @@ class SpATS:
         self._design_info = design_info
         self._beta = beta
         self._u = u
-        
+
         # Fitted values for all observations
         self.fitted_values = np.full(len(self.data), np.nan)
         self.fitted_values[self.valid_obs] = mu
-        
+
         # Decompose fitted values into components
         self._decompose_fitted_components(design_info, beta, u)
-        
+
         # Residuals
         y_full = self.data[self.response].values
         self.residuals = np.full(len(self.data), np.nan)
         valid_idx = self.valid_obs & ~pd.isnull(y_full)
         self.residuals[valid_idx] = (y_full[valid_idx] - self.fitted_values[valid_idx])
-        
+
         # Coefficients
         self.coefficients = np.concatenate([beta, u])
-        
+
         # Variance components
-        self.var_comp = {f'component_{i}': lambda_params[i+1] 
+        self.var_comp = {f'component_{i}': lambda_params[i+1]
                         for i in range(len(lambda_params)-1)}
         self.psi = lambda_params[0]
-        
+
         # Model information
         self.deviance = deviance
         self.n_iterations = n_iter
         self.n_obs = self.n_obs
-        
+
+        # Store genotype counts for heritability calculation
+        self._n_geno = design_info.get('n_geno_fixed') or design_info.get('n_geno_random')
+
         # Effective dimensions (simplified)
         self.effective_dim = {
             'fixed': design_info['X'].shape[1],
             'spatial': len(design_info['penalty_matrices'][0].data) if design_info['penalty_matrices'] else 0
         }
+
+        # Calculate genotype effective dimension for fixed genotypes
+        if design_info.get('n_geno_fixed') is not None:
+            # For fixed genotypes, ED_geno equals number of genotype parameters
+            # which is n_geno - 1 (drop_first=True in dummy coding) plus intercept contribution
+            # Simplification: ED_geno ≈ n_geno - 1
+            self._ED_geno = design_info['n_geno_fixed'] - 1
+        else:
+            self._ED_geno = None
     
     def _decompose_fitted_components(self, design_info, beta, u):
         """Decompose fitted values into fixed, spatial, and other random components."""
@@ -633,12 +651,12 @@ class SpATS:
     def predict(self, newdata=None):
         """
         Make predictions from fitted model.
-        
+
         Parameters
         ----------
         newdata : pd.DataFrame, optional
             New data for prediction. If None, returns fitted values.
-            
+
         Returns
         -------
         np.ndarray
@@ -646,10 +664,69 @@ class SpATS:
         """
         if newdata is None:
             return self.fitted_values
-        
+
         # For new data prediction, would need to reconstruct design matrices
         # This is a simplified implementation
         raise NotImplementedError("Prediction on new data not yet implemented")
+
+    def get_heritability(self, mode: str = "generalized") -> float:
+        """
+        Calculate heritability from genotype effective dimension.
+
+        Default heritability follows SpATS generalized H² = ED_geno / n_geno.
+        For comparison with older results, set mode='classical' to compute
+        ED_geno / (n_geno - 1).
+
+        Parameters
+        ----------
+        mode : {"generalized", "classical"}, default="generalized"
+            - "generalized": ED_geno / n_geno       (SpATS-style generalized H²)
+            - "classical"  : ED_geno / (n_geno - 1) (legacy)
+
+        Returns
+        -------
+        float
+            Heritability estimate
+
+        Raises
+        ------
+        ValueError
+            If genotype is not treated as fixed effect or model is not fitted
+
+        Examples
+        --------
+        >>> model = SpATS(response='yield', genotype='geno', spatial=('col','row'), data=data)
+        >>> h2 = model.get_heritability()  # generalized (default)
+        >>> h2_classical = model.get_heritability(mode='classical')  # legacy
+        """
+        if not hasattr(self, '_ED_geno') or self._ED_geno is None:
+            raise ValueError("Heritability is only available when genotype is treated as fixed effect")
+
+        if not hasattr(self, '_n_geno') or self._n_geno is None:
+            raise ValueError("Model must be fitted before calculating heritability")
+
+        from .utils import get_heritability
+        return get_heritability(self._ED_geno, self._n_geno, mode=mode)
+
+    @property
+    def heritability(self) -> float:
+        """
+        Heritability estimate using generalized method (H² = ED_geno / n_geno).
+
+        For classical heritability (ED_geno / (n_geno - 1)), use:
+        model.get_heritability(mode='classical')
+
+        Returns
+        -------
+        float
+            Generalized heritability estimate
+
+        Raises
+        ------
+        ValueError
+            If genotype is not treated as fixed effect or model is not fitted
+        """
+        return self.get_heritability(mode="generalized")
     
     def summary(self, which="dimensions"):
         """

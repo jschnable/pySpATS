@@ -307,7 +307,7 @@ def validate_data_structure(data: pd.DataFrame, response: str,
 def compute_aic_bic(deviance: float, effective_dim: float, n_obs: int) -> Tuple[float, float]:
     """
     Compute AIC and BIC from model deviance.
-    
+
     Parameters
     ----------
     deviance : float
@@ -316,7 +316,7 @@ def compute_aic_bic(deviance: float, effective_dim: float, n_obs: int) -> Tuple[
         Effective number of parameters
     n_obs : int
         Number of observations
-        
+
     Returns
     -------
     tuple
@@ -324,5 +324,50 @@ def compute_aic_bic(deviance: float, effective_dim: float, n_obs: int) -> Tuple[
     """
     aic = deviance + 2 * effective_dim
     bic = deviance + np.log(n_obs) * effective_dim
-    
+
     return aic, bic
+
+
+def get_heritability(ED_geno: float, n_geno: int, mode: str = "generalized") -> float:
+    """
+    Compute heritability from genotype effective dimension.
+
+    Default heritability follows SpATS generalized H² = ED_geno / n_geno.
+    For comparison with older results, set mode='classical' to compute
+    ED_geno / (n_geno - 1).
+
+    Parameters
+    ----------
+    ED_geno : float
+        Effective dimension attributed to genotype.
+    n_geno : int
+        Number of genotypes.
+    mode : {"generalized", "classical"}, default="generalized"
+        - "generalized": ED_geno / n_geno       (SpATS-style generalized H²)
+        - "classical"  : ED_geno / (n_geno - 1) (legacy)
+
+    Returns
+    -------
+    float
+        Heritability estimate
+
+    Raises
+    ------
+    ValueError
+        If n_geno <= 1 or mode is not recognized
+
+    Examples
+    --------
+    >>> get_heritability(50.0, 100, mode="generalized")
+    0.5
+    >>> get_heritability(50.0, 100, mode="classical")
+    0.50505...
+    """
+    if n_geno <= 1:
+        raise ValueError("n_geno must be > 1")
+    if mode == "generalized":
+        return ED_geno / float(n_geno)
+    elif mode == "classical":
+        return ED_geno / float(n_geno - 1)
+    else:
+        raise ValueError("mode must be 'generalized' or 'classical'")
