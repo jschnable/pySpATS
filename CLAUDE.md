@@ -19,6 +19,9 @@ pip install -e .
 
 # Install with dependencies
 pip install -r requirements.txt
+
+# Optional: Install scikit-sparse for exact ED computation (requires SuiteSparse/CHOLMOD)
+pip install scikit-sparse
 ```
 
 ### Testing
@@ -106,6 +109,12 @@ The SpATS model fitting follows this sequence:
 - `PSANOVA()`: P-spline ANOVA functionality
 - `interpret_formula()`: Formula parsing for model specification
 - `get_heritability()`: Heritability calculation from effective dimensions (generalized and classical modes)
+
+**`pyspats/ed_selected_inverse.py`**: Exact effective dimension computation
+- `ed_components_from_selected_inverse()`: Computes exact ED_k = m_k - tr(G_k^{-1} C^{-1}_{kk}) using CHOLMOD
+- `BlockInfo`: Helper class for defining random effect blocks
+- Uses sparse Cholesky factorization to extract diagonal of inverse without forming full inverse
+- Requires scikit-sparse with SuiteSparse/CHOLMOD (optional, gracefully degrades if unavailable)
 
 ### Data Flow
 

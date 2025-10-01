@@ -5,7 +5,19 @@ SAP (Separation of Anisotropic Penalties) algorithm solver.
 import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
+
+# Try to import exact ED computation
+try:
+    from .ed_selected_inverse import (
+        ed_components_from_selected_inverse,
+        BlockInfo,
+        is_cholmod_available
+    )
+    EXACT_ED_AVAILABLE = True
+except ImportError:
+    EXACT_ED_AVAILABLE = False
+    is_cholmod_available = lambda: False
 
 
 class SAP_solver:
@@ -17,9 +29,15 @@ class SAP_solver:
     separation in multidimensional generalized P-splines: the SAP algorithm"
     """
     
-    def __init__(self, tolerance: float = 1e-6, max_iter: int = 100):
+    def __init__(
+        self,
+        tolerance: float = 1e-6,
+        max_iter: int = 100,
+        use_exact_ed: bool = True
+    ):
         self.tolerance = tolerance
         self.max_iter = max_iter
+        self.use_exact_ed = use_exact_ed and EXACT_ED_AVAILABLE and is_cholmod_available()
     
     def solve(
         self,

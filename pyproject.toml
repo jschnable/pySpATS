@@ -38,6 +38,9 @@ dependencies = [
 ]
 requires-python = ">=3.8"
 
+[project.optional-dependencies]
+spatial = ["scikit-sparse>=0.4.14"]
+
 [project.urls]
 "Homepage" = "https://github.com/schnablelab/python-spats"
 "Bug Reports" = "https://github.com/schnablelab/python-spats/issues"

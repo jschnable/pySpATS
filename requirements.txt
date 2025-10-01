@@ -3,3 +3,5 @@ pandas>=1.3.0
 scipy>=1.7.0
 matplotlib>=3.3.0
 scikit-learn>=1.0.0
+# Optional: for exact ED computation via CHOLMOD selected inverse
+# scikit-sparse>=0.4.14

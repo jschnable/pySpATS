@@ -61,6 +61,25 @@ cd python-spats
 pip install -e .
 ```
 
+### Optional: Exact ED Computation with CHOLMOD
+
+For exact effective dimension computation via sparse Cholesky selected inverse:
+
+```bash
+# Install scikit-sparse (requires SuiteSparse/CHOLMOD system library)
+pip install scikit-sparse
+
+# On macOS with Homebrew:
+brew install suite-sparse
+pip install scikit-sparse
+
+# On Ubuntu/Debian:
+sudo apt-get install libsuitesparse-dev
+pip install scikit-sparse
+```
+
+If scikit-sparse is not available, pySpATS will use approximate ED calculations.
+
 ## Quick Start
 
 ```python
