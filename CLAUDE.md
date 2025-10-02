@@ -129,6 +129,20 @@ The SpATS model fitting follows this sequence:
 - Uses sparse Cholesky factorization to extract diagonal of inverse without forming full inverse
 - Requires scikit-sparse with SuiteSparse/CHOLMOD (optional, gracefully degrades if unavailable)
 
+**`pyspats/reml/`**: REML optimizer with factorization reuse and ED-based updates
+- **`optimizer.py`**: Main REML estimation routine
+  - `fit_reml()`: Iterative REML with one CHOLMOD factorization per iteration
+  - `REMLOptions`: Configuration (max_iter, tolerances, verbosity)
+  - `REMLResult`: Result container with variance components, EDs, and convergence status
+- **`assembly_adapter.py`**: Mixed model assembly utilities
+  - `make_assemble_fn()`: Wraps design builders to create C(θ) and RHS
+  - `make_builder_from_psanova()`: Convenience builder for PS-ANOVA designs
+- **Key features**:
+  - Reuses CHOLMOD factorization for solving and ED computation
+  - Closed-form variance updates: σ²_k = (u_k' u_k) / ED_k
+  - No stochastic approximations; fully deterministic
+  - Typically converges in 10-20 iterations
+
 ### Data Flow
 
 ```

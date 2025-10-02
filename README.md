@@ -38,6 +38,17 @@ pySpATS uses **PS-ANOVA** (Penalized Spline ANOVA) decomposition for spatial mod
 
 This ensures clean variance decomposition and accurate effective dimension (ED) computation for heritability estimation, matching the R SpATS implementation.
 
+### REML with ED-Based Variance Updates
+
+pySpATS implements efficient **REML** (Restricted Maximum Likelihood) estimation:
+
+- **One CHOLMOD factorization per iteration**: Factorize C(θ) once, reuse for solving and ED computation
+- **Exact effective dimensions**: ED computed via Takahashi selected inverse (no approximations)
+- **Closed-form variance updates**: σ²_k = (u_k' u_k) / ED_k for random effects, σ²_ε = (e' e) / (n - rank(X)) for residuals
+- **Fast convergence**: Typically 10-20 iterations to convergence on field trial data
+
+This matches standard SpATS/LMMsolver practice with exact ED computation.
+
 ## Visual Example: Real Sorghum Field Trial Analysis
 
 Here's what pySpATS can do with your field trial data, demonstrated using a real sorghum dataset with 1,401 observations and 347 genotypes:
