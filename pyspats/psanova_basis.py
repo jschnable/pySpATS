@@ -724,8 +724,13 @@ def tensor_whiten_interaction(
         # Compute Kronecker sum of eigenvalues: λ_rc[i,j] = λ_r[i] + λ_c[j]
         lambda_sum = lr[:, None] + lc[None, :]  # (len(lr), len(lc))
 
-        # Create mask for positive modes (sum > tol)
-        keep_mask_full = lambda_sum > tol  # Boolean mask (len(lr), len(lc))
+        # Use relative tolerance to avoid scale sensitivity
+        # tol_effective = tol * max(max(λ_r), max(λ_c))
+        max_eigenvalue = max(np.max(lr), np.max(lc))
+        tol_effective = tol * max_eigenvalue
+
+        # Create mask for positive modes (sum > tol_effective)
+        keep_mask_full = lambda_sum > tol_effective  # Boolean mask (len(lr), len(lc))
 
         # Keep ALL row/col modes (no pre-filtering)
         # We'll select valid pairs directly via keep_mask

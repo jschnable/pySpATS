@@ -905,6 +905,30 @@ class SpATS:
             ed_resid = self.n_obs - total_ed
             print(f"  Residual ED (approx):             {ed_resid:>8.2f}")
             print()
+
+            # Show percentage breakdown
+            print("Percentage of degrees of freedom:")
+            print("-" * 60)
+            if 'fixed' in self.effective_dim:
+                pct_fixed = 100.0 * self.effective_dim['fixed'] / self.n_obs
+                print(f"  Fixed effects:                    {pct_fixed:>7.2f}%")
+
+            if hasattr(self, '_design_info') and 'block_info' in self._design_info:
+                blocks = self._design_info['block_info']
+                for block in blocks:
+                    pct_block = 100.0 * block.size / self.n_obs
+                    print(f"  {block.name:30s}  {pct_block:>7.2f}%")
+            elif 'spatial' in self.effective_dim:
+                pct_spatial = 100.0 * self.effective_dim['spatial'] / self.n_obs
+                print(f"  Spatial effects:                  {pct_spatial:>7.2f}%")
+
+            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
+                pct_geno = 100.0 * self._ED_geno / self.n_obs
+                print(f"  Genotype:                         {pct_geno:>7.2f}%")
+
+            pct_resid = 100.0 * ed_resid / self.n_obs
+            print(f"  Residual:                         {pct_resid:>7.2f}%")
+            print()
         else:
             print("No effective dimension information available.")
             print("Model may not have been fitted yet.")
