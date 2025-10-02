@@ -21,7 +21,8 @@ The adapter ensures:
 from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
-from typing import Dict, List, Tuple, Callable
+from scipy.sparse.linalg import LinearOperator
+from typing import Dict, List, Tuple, Callable, Union
 
 from ..ed_selected_inverse import BlockInfo
 
@@ -130,8 +131,16 @@ def make_assemble_fn(builder: Callable) -> Callable:
             Z_list.append(Zk)
             start += m
 
+        # Check if any blocks are LinearOperators
+        has_linear_operator = any(isinstance(z, LinearOperator) for z in Z_list)
+
         # Concatenate all random effect design matrices
-        if Z_list:
+        # Skip for LinearOperators since we'll use Schur complement path
+        if has_linear_operator:
+            # Don't build Z - it won't be used in Schur path
+            # Return a placeholder that won't be accessed
+            Z = None
+        elif Z_list:
             Z = sp.hstack(Z_list, format="csc")
         else:
             Z = sp.csc_matrix((n, 0))
@@ -144,65 +153,72 @@ def make_assemble_fn(builder: Callable) -> Callable:
         # For R = σ²_ε I, we have R^{-1} = lam_eps I
         # So X'R^{-1}X = lam_eps * X'X, etc.
 
-        # Convert X to sparse if needed for efficient operations
-        if not sp.issparse(X):
-            X = sp.csr_matrix(X)
-
-        Xt = X.T
-        Zt = Z.T
-
-        # Upper-left block: X'R^{-1}X
-        XtX = lam_eps * (Xt @ X)
-
-        # Upper-right block: X'R^{-1}Z
-        if Z.shape[1] > 0:
-            XtZ = lam_eps * (Xt @ Z)
+        # If using LinearOperators, skip building C (will use Schur path)
+        if has_linear_operator:
+            # Return placeholders - won't be used in Schur path
+            C = None
+            rhs = None
         else:
-            XtZ = sp.csc_matrix((p, 0))
+            # Convert X to sparse if needed for efficient operations
+            if not sp.issparse(X):
+                X = sp.csr_matrix(X)
 
-        # Lower-left block: Z'R^{-1}X
-        ZtX = XtZ.T
+            Xt = X.T
+            Zt = Z.T
 
-        # Lower-right block: Z'R^{-1}Z + G^{-1}
-        if Z.shape[1] > 0:
-            ZtZ = lam_eps * (Zt @ Z)
+            # Upper-left block: X'R^{-1}X
+            XtX = lam_eps * (Xt @ X)
 
-            # Add penalty matrices G^{-1} = diag(1/σ²_k I_k)
-            # For each block k: G_k = σ²_k I, so G_k^{-1} = (1/σ²_k) I
-            g_inv_blocks = []
-            for b in blocks:
-                lam_k = 1.0 / theta[b.name]
-                g_inv_blocks.append(sp.eye(b.size, format="csc") * lam_k)
+            # Upper-right block: X'R^{-1}Z
+            if Z.shape[1] > 0:
+                XtZ = lam_eps * (Xt @ Z)
+            else:
+                XtZ = sp.csc_matrix((p, 0))
 
-            Ginv = sp.block_diag(g_inv_blocks, format="csc")
-            ZtZ_plus_Ginv = ZtZ + Ginv
-        else:
-            ZtZ_plus_Ginv = sp.csc_matrix((0, 0))
+            # Lower-left block: Z'R^{-1}X
+            ZtX = XtZ.T
 
-        # Assemble full coefficient matrix C(θ)
-        if Z.shape[1] > 0:
-            C = sp.bmat([
-                [XtX, XtZ],
-                [ZtX, ZtZ_plus_Ginv]
-            ], format="csc")
-        else:
-            # No random effects
-            C = XtX.tocsc()
+            # Lower-right block: Z'R^{-1}Z + G^{-1}
+            if Z.shape[1] > 0:
+                ZtZ = lam_eps * (Zt @ Z)
 
-        # Right-hand side
-        rhs_top = lam_eps * (Xt @ y)
-        if Z.shape[1] > 0:
-            rhs_bot = lam_eps * (Zt @ y)
-            rhs = np.concatenate([
-                np.asarray(rhs_top).ravel(),
-                np.asarray(rhs_bot).ravel()
-            ])
-        else:
-            rhs = np.asarray(rhs_top).ravel()
+                # Add penalty matrices G^{-1} = diag(1/σ²_k I_k)
+                # For each block k: G_k = σ²_k I, so G_k^{-1} = (1/σ²_k) I
+                g_inv_blocks = []
+                for b in blocks:
+                    lam_k = 1.0 / theta[b.name]
+                    g_inv_blocks.append(sp.eye(b.size, format="csc") * lam_k)
+
+                Ginv = sp.block_diag(g_inv_blocks, format="csc")
+                ZtZ_plus_Ginv = ZtZ + Ginv
+            else:
+                ZtZ_plus_Ginv = sp.csc_matrix((0, 0))
+
+            # Assemble full coefficient matrix C(θ)
+            if Z.shape[1] > 0:
+                C = sp.bmat([
+                    [XtX, XtZ],
+                    [ZtX, ZtZ_plus_Ginv]
+                ], format="csc")
+            else:
+                # No random effects
+                C = XtX.tocsc()
+
+            # Right-hand side
+            rhs_top = lam_eps * (Xt @ y)
+            if Z.shape[1] > 0:
+                rhs_bot = lam_eps * (Zt @ y)
+                rhs = np.concatenate([
+                    np.asarray(rhs_top).ravel(),
+                    np.asarray(rhs_bot).ravel()
+                ])
+            else:
+                rhs = np.asarray(rhs_top).ravel()
 
         # Attach metadata as function attributes for fit_reml to access
         assemble_fn.beta_slice = slice(0, p)
-        assemble_fn.random_slice = slice(p, p + Z.shape[1])
+        total_random = sum(b.size for b in blocks)
+        assemble_fn.random_slice = slice(p, p + total_random)
         assemble_fn.y = y
 
         return C, rhs, blocks, rank_X, n, X, Z_dict
@@ -212,9 +228,9 @@ def make_assemble_fn(builder: Callable) -> Callable:
 
 def make_builder_from_psanova(
     X_poly: np.ndarray,
-    Z_r: np.ndarray,
-    Z_c: np.ndarray,
-    Z_rc: np.ndarray,
+    Z_r: Union[np.ndarray, sp.spmatrix],
+    Z_c: Union[np.ndarray, sp.spmatrix],
+    Z_rc: Union[np.ndarray, sp.spmatrix, LinearOperator],
     y: np.ndarray,
     genotype_Z: np.ndarray = None,
     other_Z_dict: Dict[str, np.ndarray] = None
@@ -229,12 +245,12 @@ def make_builder_from_psanova(
     ----------
     X_poly : np.ndarray
         Fixed polynomial design: [1, r_norm, c_norm]
-    Z_r : np.ndarray
+    Z_r : np.ndarray or sparse matrix
         Row-smooth random design
-    Z_c : np.ndarray
+    Z_c : np.ndarray or sparse matrix
         Column-smooth random design
-    Z_rc : np.ndarray
-        Interaction random design
+    Z_rc : np.ndarray, sparse matrix, or LinearOperator
+        Interaction random design (can be LinearOperator for Kronecker path)
     y : np.ndarray
         Response vector
     genotype_Z : np.ndarray, optional
@@ -247,6 +263,11 @@ def make_builder_from_psanova(
     builder : callable
         Builder function for make_assemble_fn()
 
+    Notes
+    -----
+    When Z_rc is a LinearOperator (e.g., from use_kron_interaction=True),
+    it will be passed through directly to the assembly function.
+
     Examples
     --------
     >>> from pyspats.psanova_basis import build_psanova_design
@@ -254,10 +275,17 @@ def make_builder_from_psanova(
     >>> builder = make_builder_from_psanova(X_poly, Z_r, Z_c, Z_rc, y)
     >>> assemble_fn = make_assemble_fn(builder)
     """
-    # Convert to sparse for efficiency
+    # Convert to sparse for efficiency (except LinearOperators)
     Z_r_sp = sp.csc_matrix(Z_r) if not sp.issparse(Z_r) else Z_r
     Z_c_sp = sp.csc_matrix(Z_c) if not sp.issparse(Z_c) else Z_c
-    Z_rc_sp = sp.csc_matrix(Z_rc) if not sp.issparse(Z_rc) else Z_rc
+
+    # Z_rc can be a LinearOperator (Kronecker path) or dense/sparse (legacy path)
+    if isinstance(Z_rc, LinearOperator):
+        Z_rc_sp = Z_rc  # Keep as LinearOperator
+    elif sp.issparse(Z_rc):
+        Z_rc_sp = Z_rc
+    else:
+        Z_rc_sp = sp.csc_matrix(Z_rc)
 
     def builder(theta: Dict[str, float]) -> Tuple:
         """Build design matrices (independent of theta in this simple case)."""

@@ -129,6 +129,22 @@ The SpATS model fitting follows this sequence:
 - Uses sparse Cholesky factorization to extract diagonal of inverse without forming full inverse
 - Requires scikit-sparse with SuiteSparse/CHOLMOD (optional, gracefully degrades if unavailable)
 
+**`pyspats/spatial/`**: Memory-efficient Kronecker-structured spatial smooths
+- **`kron_utils.py`**: Lazy Kronecker product operators
+  - `kron_matvec()`: Compute (A ⊗ B) @ v using vec(A @ X @ B^T) identity
+  - `kron_rmatvec()`: Compute (A ⊗ B)^T @ w using reverse Kronecker identity
+  - `kron_linear_operator()`: Wraps Kronecker product as scipy LinearOperator
+- **`projection.py`**: Polynomial projection for PS-ANOVA orthogonality
+  - `LeftProjectedLO`: LinearOperator wrapper applying P_⊥ = I - Q_x Q_x^T on left
+  - Works on both matvec and rmatvec to ensure X_poly^T @ Z_rc ≈ 0
+- **`gram_kron.py`**: Efficient Z'Z and X'Z using Gram matrices
+  - `compute_GrGc()`: Computes small dense Gram matrices from transformed bases
+  - `build_interaction_gram_terms()`: Main entry point for Kronecker block assembly
+  - `projected_ZtZ()`: Applies polynomial projection correction with numerical safeguards
+  - `XtZ_poly_zero()`: Returns exact zeros for polynomial-interaction cross term
+  - `XtZ_other()`: Efficiently computes X'Z for non-polynomial fixed effects
+- **Integration**: Gram-based Z'Z detected via `_gram_meta` attribute in `schur.py`
+
 **`pyspats/reml/`**: REML optimizer with factorization reuse and ED-based updates
 - **`optimizer.py`**: Main REML estimation routine
   - `fit_reml()`: Iterative REML with Schur complement sparse/dense split (default)
@@ -140,6 +156,7 @@ The SpATS model fitting follows this sequence:
   - `schur_reduce()`: Builds S = Z'R⁻¹Z + G⁻¹ - Z'R⁻¹X (X'R⁻¹X)⁻¹ X'R⁻¹Z
   - `schur_rhs()`: Computes reduced RHS r = Z'R⁻¹y - Z'R⁻¹X (X'R⁻¹X)⁻¹ X'R⁻¹y
   - `recover_beta()`: Recovers β = (X'R⁻¹X)⁻¹ [X'R⁻¹(y - Z u)]
+  - `_compute_ZtZ_gram_aware()`: Detects Kronecker blocks and uses Gram formulas
   - More efficient than full C when fixed effects are small/dense and random effects are large/sparse
 - **`assembly_adapter.py`**: Mixed model assembly utilities
   - `make_assemble_fn()`: Wraps design builders to create C(θ) and RHS
@@ -217,6 +234,60 @@ Where:
 - Block structure: Contiguous, non-overlapping indices
 
 This matches the R SpATS implementation and ensures accurate heritability estimation.
+
+### Kronecker-Structured Interaction Smooth (Memory-Efficient)
+
+The 2D interaction smooth `f_rc(r, c)` uses **Kronecker product structure** for memory efficiency with large field layouts:
+
+**Tensor Product Basis:**
+```
+Z_rc = (B_r ⊗ B_c) @ U_rc @ Λ_rc^{1/2}
+```
+
+Instead of materializing the full `(n × p_r·p_c)` matrix, pySpATS uses:
+
+1. **Lazy LinearOperator** (`spatial/kron_utils.py`): Implements `Z_rc @ v` using `vec(A @ X @ B^T)` identity
+   - Avoids storing full Kronecker product
+   - Memory: O(n·p_r + n·p_c) instead of O(n·p_r·p_c)
+
+2. **Exact Mode Selection** (`psanova_basis.py:tensor_whiten_interaction`):
+   - Uses **Kronecker sum eigenvalues**: λ_rc[i,j] = λ_r[i] + λ_c[j]
+   - Keeps mode (i,j) where λ_rc[i,j] > tol (not independent row/col filtering)
+   - Matches dense path dimensions exactly
+
+3. **Polynomial Projection** (`spatial/projection.py:LeftProjectedLO`):
+   - Applies P_⊥ = I - Q_x Q_x^T on left for PS-ANOVA orthogonality
+   - Works on both matvec and rmatvec operations
+   - Ensures X_poly^T @ Z_rc ≈ 0 without forming dense matrix
+
+4. **Gram-Based Z'Z and X'Z** (`spatial/gram_kron.py`):
+   - Computes small dense Gram matrices: G_r = (B_r U_r^+)^T @ (B_r U_r^+), G_c similar
+   - Builds Z'Z using Kronecker algebra: Z'Z = Λ_rc^{1/2} (G_r ⊗ G_c) Λ_rc^{1/2}
+   - Applies polynomial projection correction numerically
+   - **Key benefit**: Eliminates O(n) observation loop, uses only O(p_r^2 · p_c^2) Gram algebra
+   - Memory: O((p_rc)^2) vs O(n · p_rc) for explicit Z
+
+5. **Numerical Safeguards** (`spatial/gram_kron.py:projected_ZtZ`):
+   - Re-orthogonalizes Q_x to ensure numerical orthonormality
+   - Symmetrizes Z'Z_proj = 0.5 * (Z'Z_proj + Z'Z_proj^T)
+   - Adds minimal jitter if eigenvalues < 0 to ensure positive definiteness
+
+**Integration with Schur Path** (`reml/schur.py:_compute_ZtZ_gram_aware`):
+- Detects blocks with `_gram_meta` attribute (attached in `psanova_basis.py`)
+- Uses Gram formulas for Kronecker interaction blocks
+- Falls back to sparse/loop methods for other random effects
+- All blocks assembled into single Z'R^{-1}Z for REML optimization
+
+**Default Behavior:**
+- `use_kron_interaction=True` (default in `psanova_basis.py:build_psanova_design`)
+- For small problems (< 1000 obs), both paths are equivalent
+- For large trials (> 5000 obs), Kronecker path avoids memory issues
+
+**Validation** (in `tests/test_kron_interaction.py`, `tests/test_projection.py`, `tests/test_exact_mode_selection.py`):
+- Dimension parity: Kronecker and dense paths produce identical Z_rc.shape[1]
+- Orthogonality: |X_poly^T @ Z_rc| < 1e-8 for both paths
+- Numerical accuracy: ||Z'Z_kron - Z'Z_dense|| < 1e-6
+- CHOLMOD stability: All REML integration tests pass with Gram-based Z'Z
 
 ### Genotype Handling
 - Genotypes can be treated as **fixed effects** (default, `genotype_as_random=False`) or **random effects** (`genotype_as_random=True`)

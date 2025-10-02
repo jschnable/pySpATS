@@ -5,7 +5,7 @@ Core SpATS implementation for spatial analysis of field trials.
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import spsolve, LinearOperator
 from scipy.linalg import cholesky, solve_triangular
 from scipy.stats import norm
 import warnings
@@ -19,6 +19,7 @@ from .utils import interpret_formula, get_heritability
 from . import plotting
 from .psanova_basis import build_psanova_design
 from .ed_selected_inverse import BlockInfo
+from .spatial.block_operator import ConcatenatedBlockOperator, BlockLinearOperator
 
 
 class SpATS:
@@ -422,7 +423,22 @@ class SpATS:
             ))
             current_idx += n_levels
 
-        Z = np.hstack(Z_parts) if Z_parts else np.zeros((len(valid_data), 0))
+        # Handle Z matrix construction - may contain LinearOperators from Kronecker path
+        if Z_parts:
+            # Check if any parts are LinearOperators
+            has_linear_operators = any(isinstance(z, LinearOperator) for z in Z_parts)
+
+            if has_linear_operators:
+                # Use ConcatenatedBlockOperator for mixed dense/LinearOperator blocks
+                wrapped_blocks = []
+                for z_block, block in zip(Z_parts, block_info):
+                    wrapped_blocks.append(BlockLinearOperator(z_block, block.name))
+                Z = ConcatenatedBlockOperator(wrapped_blocks, block_info)
+            else:
+                # All dense - use normal hstack
+                Z = np.hstack(Z_parts)
+        else:
+            Z = np.zeros((len(valid_data), 0))
 
         return {
             'X': X,
@@ -439,7 +455,20 @@ class SpATS:
         X = design_info['X']
         Z = design_info['Z']
         penalties = design_info['penalty_matrices']
-        
+
+        # Convert LinearOperator to dense array if needed (for compatibility with simplified solver)
+        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
+            # Materialize the full matrix for this simple solver
+            # (The REML optimizer path handles LinearOperators efficiently)
+            n_obs = X.shape[0]
+            n_random = Z.shape[1]
+            Z_dense = np.zeros((n_obs, n_random))
+            for j in range(n_random):
+                e_j = np.zeros(n_random)
+                e_j[j] = 1.0
+                Z_dense[:, j] = Z @ e_j
+            Z = Z_dense
+
         # Weight matrices
         W = sparse.diags(w)
         
@@ -505,10 +534,21 @@ class SpATS:
         """Update variance components using REML."""
         # Simplified variance component update
         # In practice, this would use the full REML equations
-        
+
         X = design_info['X']
         Z = design_info['Z']
-        
+
+        # Convert LinearOperator to dense array if needed
+        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
+            n_obs = X.shape[0]
+            n_random = Z.shape[1]
+            Z_dense = np.zeros((n_obs, n_random))
+            for j in range(n_random):
+                e_j = np.zeros(n_random)
+                e_j[j] = 1.0
+                Z_dense[:, j] = Z @ e_j
+            Z = Z_dense
+
         # Residuals
         residuals = z - X @ beta - Z @ u
         
@@ -605,15 +645,26 @@ class SpATS:
         """Decompose fitted values into fixed, spatial, and other random components."""
         X = design_info['X']
         Z = design_info['Z']
-        
+
+        # Convert LinearOperator to dense array if needed
+        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
+            n_obs = X.shape[0]
+            n_random = Z.shape[1]
+            Z_dense = np.zeros((n_obs, n_random))
+            for j in range(n_random):
+                e_j = np.zeros(n_random)
+                e_j[j] = 1.0
+                Z_dense[:, j] = Z @ e_j
+            Z = Z_dense
+
         # Initialize component arrays
         self.spatial_effects = np.full(len(self.data), np.nan)
         self.random_effects = np.full(len(self.data), np.nan)
         self.fixed_effects = np.full(len(self.data), np.nan)
-        
+
         # Initialize spatial centering adjustment
         spatial_mean_adjustment = 0.0
-        
+
         if len(u) > 0 and Z.shape[1] > 0:
             # Decompose random effects by component
             penalty_matrices = design_info['penalty_matrices']
@@ -769,7 +820,7 @@ class SpATS:
     def summary(self, which="dimensions"):
         """
         Print model summary.
-        
+
         Parameters
         ----------
         which : str
@@ -781,17 +832,86 @@ class SpATS:
         print(f"Observations: {self.n_obs}")
         print(f"Deviance: {self.deviance:.4f}")
         print(f"Iterations: {self.n_iterations}")
-        
+
         if which in ["dimensions", "all"]:
             print("\nModel Dimensions:")
             for component, dim in self.effective_dim.items():
                 print(f"  {component}: {dim}")
-                
+
         if which in ["variances", "all"]:
             print("\nVariance Components:")
             print(f"  Dispersion (psi): {self.psi:.6f}")
             for component, var in self.var_comp.items():
                 print(f"  {component}: {var:.6f}")
+
+    def summary_ed(self):
+        """
+        Print effective dimension (ED) summary for all model components.
+
+        Effective dimensions quantify the "amount of smoothing" or complexity
+        consumed by each random effect. For spatial smooths in PS-ANOVA:
+        - row_smooth: ED for row-wise spatial trend
+        - col_smooth: ED for column-wise spatial trend
+        - interaction_smooth: ED for 2D spatial interaction (non-separable pattern)
+
+        Higher ED indicates less smoothing (more model flexibility), while
+        lower ED indicates more aggressive smoothing (simpler surface).
+
+        Note: Current implementation uses nominal dimensions as approximations.
+        For exact CHOLMOD-based EDs, use the REML optimizer path.
+
+        Examples
+        --------
+        >>> model = SpATS(response='yield', genotype='geno', spatial=('col','row'), data=data)
+        >>> model.summary_ed()
+        """
+        print("SpATS Effective Dimension Summary")
+        print("=" * 60)
+        print(f"Response: {self.response}")
+        print(f"Observations: {self.n_obs}")
+        print()
+
+        if hasattr(self, 'effective_dim') and self.effective_dim:
+            print("Effective Dimensions:")
+            print("-" * 60)
+
+            # Fixed effects
+            if 'fixed' in self.effective_dim:
+                print(f"  Fixed effects:                    {self.effective_dim['fixed']:>8.2f}")
+
+            # Spatial components (from block_info if available)
+            if hasattr(self, '_design_info') and 'block_info' in self._design_info:
+                blocks = self._design_info['block_info']
+                for block in blocks:
+                    # Use block size as nominal dimension approximation
+                    ed_approx = block.size
+                    print(f"  {block.name:30s}  {ed_approx:>8.2f} (nominal)")
+            elif 'spatial' in self.effective_dim:
+                print(f"  Spatial effects:                  {self.effective_dim['spatial']:>8.2f}")
+
+            # Genotype
+            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
+                print(f"  Genotype:                         {self._ED_geno:>8.2f}")
+
+            print("-" * 60)
+
+            # Total model ED (approximate)
+            total_ed = sum(self.effective_dim.values())
+            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
+                total_ed += self._ED_geno
+            print(f"  Total model ED (approx):          {total_ed:>8.2f}")
+
+            # Residual ED estimate
+            ed_resid = self.n_obs - total_ed
+            print(f"  Residual ED (approx):             {ed_resid:>8.2f}")
+            print()
+        else:
+            print("No effective dimension information available.")
+            print("Model may not have been fitted yet.")
+            print()
+
+        print("Note: EDs shown are nominal dimensions (parameter counts).")
+        print("For exact EDs accounting for smoothing penalties, use REML optimizer.")
     
     def plot(self, all_in_one: bool = True, figsize: Tuple[int, int] = (15, 10), 
              show: bool = True, spa_trend: str = 'raw'):

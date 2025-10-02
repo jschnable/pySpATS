@@ -290,8 +290,13 @@ class TestPSANOVADesign:
 
         for Z_block, name in [(Z_r, 'row'), (Z_c, 'col'), (Z_rc, 'interaction')]:
             if Z_block.shape[1] > 0:
-                # Sum columns of Z_block
-                z_sum = Z_block.sum(axis=1) if Z_block.shape[1] > 1 else Z_block.ravel()
+                # Sum columns of Z_block (handle LinearOperators)
+                from scipy.sparse.linalg import LinearOperator
+                if isinstance(Z_block, LinearOperator):
+                    # Materialize by computing Z @ ones vector
+                    z_sum = Z_block @ np.ones(Z_block.shape[1])
+                else:
+                    z_sum = Z_block.sum(axis=1) if Z_block.shape[1] > 1 else Z_block.ravel()
 
                 # Fit polynomial
                 coef, *_ = np.linalg.lstsq(poly_design, z_sum, rcond=None)
@@ -329,8 +334,11 @@ class TestPSANOVADesign:
 
         # Check sizes match Z dimensions
         total_cols = sum(b.size for b in random_blocks)
-        Z_total = np.hstack([Z_r, Z_c, Z_rc])
-        assert Z_total.shape[1] == total_cols
+
+        # Verify total columns (handle LinearOperators)
+        from scipy.sparse.linalg import LinearOperator
+        expected_total = Z_r.shape[1] + Z_c.shape[1] + Z_rc.shape[1]
+        assert expected_total == total_cols, f"Block sizes {total_cols} don't match Z dimensions {expected_total}"
 
     def test_psanova_fixed_poly_structure(self):
         """Test that fixed polynomial has expected structure."""

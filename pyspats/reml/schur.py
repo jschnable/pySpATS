@@ -25,12 +25,184 @@ This is more efficient than factorizing the full C matrix because:
 from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
-from typing import Dict, List, Tuple
+from scipy.sparse.linalg import LinearOperator
+from typing import Dict, List, Tuple, Union
+
+# Import Gram matrix utilities for efficient Kronecker interaction
+try:
+    from ..spatial.gram_kron import build_interaction_gram_terms
+    GRAM_AVAILABLE = True
+except ImportError:
+    GRAM_AVAILABLE = False
+
+
+def _compute_ZtZ_gram_aware(
+    Z: Union[sp.spmatrix, LinearOperator, "ConcatenatedBlockOperator"],
+    Rinv_scale: float,
+    X: Union[sp.spmatrix, np.ndarray]
+) -> Tuple[Union[sp.spmatrix, np.ndarray], Union[sp.spmatrix, np.ndarray]]:
+    """
+    Compute Z'R^{-1}Z and X'R^{-1}Z using Gram matrices when available.
+
+    For blocks with `_gram_meta` attribute (Kronecker interaction), uses
+    efficient Gram-matrix-based computation. For other blocks, uses standard
+    sparse or loop-based methods.
+
+    Parameters
+    ----------
+    Z : sparse matrix, LinearOperator, or ConcatenatedBlockOperator
+        Random effect design matrix (n × m)
+    Rinv_scale : float
+        Precision scaling: 1/σ²_ε
+    X : sparse matrix or ndarray
+        Fixed effect design matrix (n × p)
+
+    Returns
+    -------
+    ZtRinvZ : sparse matrix or ndarray
+        Z'R^{-1}Z (m × m)
+    XtRinvZ : sparse matrix or ndarray
+        X'R^{-1}Z (p × m)
+
+    Notes
+    -----
+    This function detects whether Z is a ConcatenatedBlockOperator containing
+    blocks with Gram metadata, and if so, uses algebraic formulas instead of
+    expensive observation loops.
+    """
+    m = Z.shape[1]
+
+    # Check if Z is a ConcatenatedBlockOperator with potential Gram blocks
+    if hasattr(Z, 'blocks') and hasattr(Z, 'block_info'):
+        # Z is ConcatenatedBlockOperator
+        # Build Z'Z and X'Z block by block
+        ZtZ_blocks = []
+        XtZ_blocks = []
+
+        for block_wrapper, info in zip(Z.blocks, Z.block_info):
+            block = block_wrapper.block
+            start, stop = info.start, info.stop
+            block_size = stop - start
+
+            # Check if this block has Gram metadata
+            if hasattr(block, '_gram_meta') and GRAM_AVAILABLE:
+                # Use Gram-based computation
+                meta = block._gram_meta
+                if meta.get('is_kron_interaction', False):
+                    # Build Z'Z and X'Z for this interaction block using Gram formulas
+                    ZtZ_block, XtZ_block = build_interaction_gram_terms(
+                        BrUr=meta['BrUr'],
+                        BcUc=meta['BcUc'],
+                        scales=meta['scales'],
+                        Z_op_unprojected=meta['Z_op_unprojected'],
+                        Qx=meta['Qx'],
+                        X=X,
+                        n_poly=3,  # Assuming 3 polynomial columns: [1, r, c]
+                        keep_mask=meta.get('keep_mask', None)  # Pass keep_mask for mode selection
+                    )
+
+                    # Scale by Rinv_scale
+                    ZtZ_block = Rinv_scale * ZtZ_block
+                    XtZ_block = Rinv_scale * XtZ_block
+
+                    ZtZ_blocks.append((start, stop, ZtZ_block))
+                    XtZ_blocks.append((start, stop, XtZ_block))
+                    continue
+
+            # Standard computation for non-Gram blocks
+            if sp.issparse(block):
+                # Sparse block: use direct multiplication
+                Zk_T = block.T
+                ZtZ_block = Rinv_scale * (Zk_T @ block)
+                XtZ_block = Rinv_scale * (X.T @ block).toarray() if sp.issparse(X.T @ block) else Rinv_scale * (X.T @ block)
+
+                ZtZ_blocks.append((start, stop, ZtZ_block))
+                XtZ_blocks.append((start, stop, XtZ_block))
+            else:
+                # LinearOperator without Gram metadata: use loop
+                ZtZ_cols = []
+                XtZ_cols = []
+
+                for j in range(block_size):
+                    e_j = np.zeros(block_size)
+                    e_j[j] = 1.0
+
+                    # Z_k @ e_j
+                    z_ej = block @ e_j
+
+                    # Z_k' @ (Z_k @ e_j)
+                    zt_z_ej = block.rmatvec(z_ej)
+                    ZtZ_cols.append(zt_z_ej)
+
+                    # X' @ (Z_k @ e_j)
+                    Xt = X.T
+                    if sp.issparse(Xt):
+                        x_z_ej = (Xt @ z_ej).toarray().ravel()
+                    else:
+                        x_z_ej = Xt @ z_ej
+                    XtZ_cols.append(x_z_ej)
+
+                ZtZ_block = Rinv_scale * np.column_stack(ZtZ_cols)
+                XtZ_block = Rinv_scale * np.column_stack(XtZ_cols)
+
+                ZtZ_blocks.append((start, stop, ZtZ_block))
+                XtZ_blocks.append((start, stop, XtZ_block))
+
+        # Assemble full Z'Z and X'Z from blocks
+        ZtRinvZ = np.zeros((m, m))
+        p = X.shape[1]
+        XtRinvZ = np.zeros((p, m))
+
+        for start, stop, ZtZ_block in ZtZ_blocks:
+            # Convert to dense if sparse
+            if sp.issparse(ZtZ_block):
+                ZtZ_block = ZtZ_block.toarray()
+            ZtRinvZ[start:stop, start:stop] = ZtZ_block
+
+        for start, stop, XtZ_block in XtZ_blocks:
+            # Convert to dense if sparse
+            if sp.issparse(XtZ_block):
+                XtZ_block = XtZ_block.toarray()
+            XtRinvZ[:, start:stop] = XtZ_block
+
+        ZtRinvZ = sp.csc_matrix(ZtRinvZ)
+        # XtRinvZ stays dense (it's p × m, typically small × large)
+
+    elif sp.issparse(Z):
+        # Simple sparse case: use direct multiplication
+        Zt = Z.T
+        ZtRinvZ = Rinv_scale * (Zt @ Z)
+        XtRinvZ = Rinv_scale * (X.T @ Z)
+    else:
+        # Generic LinearOperator: use loop (fallback)
+        ZtRinvZ_list = []
+        XtRinvZ_list = []
+
+        for j in range(m):
+            e_j = np.zeros(m)
+            e_j[j] = 1.0
+
+            z_ej = Z @ e_j
+            zt_z_ej = Z.rmatvec(z_ej)
+            ZtRinvZ_list.append(zt_z_ej)
+
+            Xt = X.T
+            if sp.issparse(Xt):
+                x_z_ej = (Xt @ z_ej).toarray().ravel()
+            else:
+                x_z_ej = Xt @ z_ej
+            XtRinvZ_list.append(x_z_ej)
+
+        ZtRinvZ = Rinv_scale * np.column_stack(ZtRinvZ_list)
+        ZtRinvZ = sp.csc_matrix(ZtRinvZ)
+        XtRinvZ = Rinv_scale * np.column_stack(XtRinvZ_list)
+
+    return ZtRinvZ, XtRinvZ
 
 
 def schur_reduce(
-    X: sp.spmatrix,
-    Z: sp.spmatrix,
+    X: Union[sp.spmatrix, np.ndarray],
+    Z: Union[sp.spmatrix, LinearOperator, "ConcatenatedBlockOperator"],
     Rinv_scale: float,
     Ginv_blocks: List[sp.spmatrix]
 ) -> Tuple[sp.csc_matrix, Dict]:
@@ -44,10 +216,11 @@ def schur_reduce(
 
     Parameters
     ----------
-    X : scipy.sparse matrix
+    X : scipy.sparse matrix or ndarray
         Fixed effect design matrix (n × p)
-    Z : scipy.sparse matrix
+    Z : scipy.sparse matrix, LinearOperator, or ConcatenatedBlockOperator
         Random effect design matrix (n × m), concatenated blocks
+        Can be a LinearOperator for efficient Kronecker products
     Rinv_scale : float
         Precision scaling: 1/σ²_ε
         Since R = σ²_ε I, we have R^{-1} = Rinv_scale * I
@@ -77,6 +250,9 @@ def schur_reduce(
 
     The matrix S has the same sparsity pattern as Z'R^{-1}Z + G^{-1}
     minus a low-rank correction (rank ≤ p).
+
+    When Z is a LinearOperator (e.g., for Kronecker-structured interactions),
+    matrix products are computed using matvec/rmatvec without materialization.
     """
     # Ensure CSC format for efficient operations
     if not sp.issparse(X):
@@ -84,15 +260,14 @@ def schur_reduce(
     elif not sp.isspmatrix_csc(X):
         X = X.tocsc()
 
-    if not sp.isspmatrix_csc(Z):
-        Z = Z.tocsc()
-
     n, p = X.shape
+
+    # Get Z dimensions
+    # Z can be sparse matrix, LinearOperator, or ConcatenatedBlockOperator (both have .shape)
     m = Z.shape[1]
 
-    # Transposes
+    # Transpose of X
     Xt = X.T
-    Zt = Z.T
 
     # Compute X'R^{-1}X (small, dense)
     # R^{-1} = Rinv_scale * I, so X'R^{-1}X = Rinv_scale * X'X
@@ -107,14 +282,12 @@ def schur_reduce(
     # Invert X'R^{-1}X (small dense inverse)
     XtRinvX_inv = np.linalg.inv(XtRinvX)
 
-    # Compute X'R^{-1}Z (p × m, typically small × large)
-    XtRinvZ = Rinv_scale * (Xt @ Z)
+    # Compute Z'R^{-1}Z and X'R^{-1}Z using Gram-aware helper
+    # This uses efficient Gram matrices for Kronecker interaction blocks
+    ZtRinvZ, XtRinvZ = _compute_ZtZ_gram_aware(Z, Rinv_scale, X)
 
-    # Compute Z'R^{-1}X (m × p, transpose of above)
+    # Compute Z'R^{-1}X (m × p, transpose of X'R^{-1}Z)
     ZtRinvX = XtRinvZ.T
-
-    # Compute Z'R^{-1}Z (m × m, sparse)
-    ZtRinvZ = Rinv_scale * (Zt @ Z)
 
     # Assemble G^{-1} (block-diagonal)
     if len(Ginv_blocks) > 0:
@@ -139,6 +312,11 @@ def schur_reduce(
     M = temp @ XtRinvZ  # (m × p) @ (p × m) = (m × m)
 
     # Schur complement: S = Z'R^{-1}Z + G^{-1} - M
+    if not sp.issparse(ZtRinvZ):
+        ZtRinvZ = sp.csc_matrix(ZtRinvZ)
+    if not sp.issparse(M):
+        M = sp.csc_matrix(M)
+
     S = (ZtRinvZ - M) + Ginv
     S = S.tocsc()
 
@@ -153,12 +331,12 @@ def schur_reduce(
 
 
 def schur_rhs(
-    X: sp.spmatrix,
-    Z: sp.spmatrix,
+    X: Union[sp.spmatrix, np.ndarray],
+    Z: Union[sp.spmatrix, LinearOperator, "ConcatenatedBlockOperator"],
     y: np.ndarray,
     Rinv_scale: float,
     XtRinvX_inv: np.ndarray,
-    XtRinvZ: sp.spmatrix
+    XtRinvZ: Union[sp.spmatrix, np.ndarray]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute reduced RHS for Schur complement system.
@@ -168,9 +346,9 @@ def schur_rhs(
 
     Parameters
     ----------
-    X : scipy.sparse matrix
+    X : scipy.sparse matrix or ndarray
         Fixed effect design matrix (n × p)
-    Z : scipy.sparse matrix
+    Z : scipy.sparse matrix, LinearOperator, or ConcatenatedBlockOperator
         Random effect design matrix (n × m)
     y : np.ndarray
         Response vector (n,)
@@ -178,7 +356,7 @@ def schur_rhs(
         Precision scaling: 1/σ²_ε
     XtRinvX_inv : np.ndarray
         Inverse of X'R^{-1}X (p × p, dense)
-    XtRinvZ : scipy.sparse matrix
+    XtRinvZ : scipy.sparse matrix or ndarray
         X'R^{-1}Z (p × m)
 
     Returns
@@ -194,6 +372,8 @@ def schur_rhs(
     -----
     The reduced RHS removes the contribution of fixed effects,
     leaving only the random-effects system to solve.
+
+    When Z is a LinearOperator, Z'y is computed using rmatvec.
     """
     # Ensure CSC format
     if not sp.issparse(X):
@@ -201,20 +381,30 @@ def schur_rhs(
     elif not sp.isspmatrix_csc(X):
         X = X.tocsc()
 
-    if not sp.isspmatrix_csc(Z):
-        Z = Z.tocsc()
-
     Xt = X.T
-    Zt = Z.T
 
-    # Compute X'R^{-1}y and Z'R^{-1}y
+    # Compute X'R^{-1}y
     XtRinvy = Rinv_scale * (Xt @ y)  # (p,)
-    ZtRinvy = Rinv_scale * (Zt @ y)  # (m,)
+
+    # Compute Z'R^{-1}y
+    if sp.issparse(Z):
+        Zt = Z.T
+        ZtRinvy = Rinv_scale * (Zt @ y)  # (m,)
+    else:
+        # Z is LinearOperator or ConcatenatedBlockOperator
+        if hasattr(Z, 'rmatvec'):
+            ZtRinvy = Rinv_scale * Z.rmatvec(y)
+        else:
+            ZtRinvy = Rinv_scale * Z.rmatvec(y)
 
     # Compute reduced RHS:
     # r = Z'R^{-1}y - (Z'R^{-1}X @ (X'R^{-1}X)^{-1}) @ X'R^{-1}y
     # Using transpose: Z'R^{-1}X = (X'R^{-1}Z)^T
-    temp = XtRinvZ.T @ XtRinvX_inv  # (m × p) @ (p × p) = (m × p)
+    if sp.issparse(XtRinvZ):
+        temp = XtRinvZ.T @ XtRinvX_inv  # (m × p) @ (p × p) = (m × p)
+    else:
+        temp = XtRinvZ.T @ XtRinvX_inv  # (m × p) @ (p × p) = (m × p)
+
     correction = temp @ XtRinvy      # (m × p) @ (p,) = (m,)
 
     if sp.issparse(correction):
@@ -233,9 +423,9 @@ def schur_rhs(
 
 
 def recover_beta(
-    X: sp.spmatrix,
+    X: Union[sp.spmatrix, np.ndarray],
     y: np.ndarray,
-    Z: sp.spmatrix,
+    Z: Union[sp.spmatrix, LinearOperator, "ConcatenatedBlockOperator"],
     u: np.ndarray,
     Rinv_scale: float,
     XtRinvX_inv: np.ndarray
@@ -248,11 +438,11 @@ def recover_beta(
 
     Parameters
     ----------
-    X : scipy.sparse matrix
+    X : scipy.sparse matrix or ndarray
         Fixed effect design matrix (n × p)
     y : np.ndarray
         Response vector (n,)
-    Z : scipy.sparse matrix
+    Z : scipy.sparse matrix, LinearOperator, or ConcatenatedBlockOperator
         Random effect design matrix (n × m)
     u : np.ndarray
         Random effect solution from Schur system (m,)
@@ -270,6 +460,8 @@ def recover_beta(
     -----
     This is the back-substitution step after solving the Schur system.
     Since X'R^{-1}X is small and already inverted, this is very fast.
+
+    When Z is a LinearOperator, Z u is computed using matvec.
     """
     # Ensure CSC format
     if not sp.issparse(X):
@@ -277,14 +469,19 @@ def recover_beta(
     elif not sp.isspmatrix_csc(X):
         X = X.tocsc()
 
-    if not sp.isspmatrix_csc(Z):
-        Z = Z.tocsc()
-
     # Compute residual from random effects: y - Z u
-    Zu = Z @ u
-    if sp.issparse(Zu):
-        Zu = Zu.toarray().ravel()
+    if sp.issparse(Z):
+        Zu = Z @ u
+        if sp.issparse(Zu):
+            Zu = Zu.toarray().ravel()
+        else:
+            Zu = np.asarray(Zu).ravel()
     else:
+        # Z is LinearOperator or ConcatenatedBlockOperator
+        if hasattr(Z, 'matvec'):
+            Zu = Z.matvec(u)
+        else:
+            Zu = Z.matvec(u)
         Zu = np.asarray(Zu).ravel()
 
     residual = y - Zu

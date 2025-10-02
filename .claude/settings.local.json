@@ -7,7 +7,9 @@
       "Bash(python:*)",
       "Bash(pip install:*)",
       "Read(/Users/jamesschnable/projects/PythonVersions/SpATS/**)",
-      "Bash(git rebase:*)"
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

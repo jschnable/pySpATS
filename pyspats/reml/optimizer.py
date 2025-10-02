@@ -20,8 +20,9 @@ from __future__ import annotations
 import os
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse.linalg import LinearOperator
 from dataclasses import dataclass, field
-from typing import Dict, List, Callable, Tuple, Optional
+from typing import Dict, List, Callable, Tuple, Optional, Union
 
 try:
     from sksparse.cholmod import cholesky
@@ -31,6 +32,7 @@ except ImportError:
     cholesky = None
 
 from ..ed_selected_inverse import ed_components_from_selected_inverse, ed_components_from_schur_inverse, BlockInfo
+from ..spatial.block_operator import BlockLinearOperator, ConcatenatedBlockOperator
 from .schur import schur_reduce, schur_rhs, recover_beta
 
 # Environment flag to disable Schur complement (for debugging only)
@@ -202,12 +204,29 @@ def fit_reml(
         _, _, blocks, rank_X, n, X, Z_dict = assemble_fn(theta)
 
         # Build concatenated Z matrix (all random effects)
+        # Check if any blocks are LinearOperators
         block_order = [b.name for b in blocks]
         Z_list = [Z_dict[name] for name in block_order]
-        if Z_list:
-            Z = sp.hstack(Z_list, format="csc")
-        else:
+
+        if not Z_list:
+            # No random effects
             Z = sp.csc_matrix((n, 0))
+            use_block_operator = False
+        else:
+            # Check if any block is a LinearOperator
+            has_linear_operator = any(isinstance(z, LinearOperator) for z in Z_list)
+
+            if has_linear_operator:
+                # Use ConcatenatedBlockOperator for mixed sparse/LinearOperator blocks
+                wrapped_blocks = []
+                for name, z in zip(block_order, Z_list):
+                    wrapped_blocks.append(BlockLinearOperator(z, name))
+                Z = ConcatenatedBlockOperator(wrapped_blocks, blocks)
+                use_block_operator = True
+            else:
+                # All blocks are sparse: use traditional hstack
+                Z = sp.hstack(Z_list, format="csc")
+                use_block_operator = False
 
         y = assemble_fn.y
         Rinv_scale = 1.0 / theta["eps"]
@@ -302,7 +321,11 @@ def fit_reml(
             Zk = Z_dict[name]
             if sp.issparse(Zk):
                 mu += Zk @ uk
+            elif isinstance(Zk, LinearOperator):
+                # Use matvec for LinearOperator
+                mu += Zk.matvec(uk)
             else:
+                # Dense array
                 mu += Zk @ uk
 
         e = y - mu

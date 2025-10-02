@@ -217,9 +217,14 @@ print(f"Classical heritability: {h2_classical:.3f}")
 print(f"Deviance: {model.deviance:.1f}")
 print(f"Effective dimensions: {model.effective_dims}")
 print(f"Observations: {model.n_obs}")
+
+# Detailed effective dimension summary
+model.summary_ed()  # Shows ED for each spatial component (row, col, interaction)
 ```
 
 **Note on Heritability**: Default heritability follows SpATS generalized H² = ED_geno / n_geno. For comparison with older results, set `mode='classical'` to compute ED_geno / (n_geno - 1).
+
+**Note on Effective Dimensions**: The `summary_ed()` method displays effective dimensions for all model components, quantifying the "amount of smoothing" for each spatial term (row, column, and interaction smooths). Higher ED indicates less smoothing (more flexibility), while lower ED indicates more aggressive smoothing.
 
 ### Visualization Options
 
