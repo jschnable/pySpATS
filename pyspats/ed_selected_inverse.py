@@ -284,6 +284,55 @@ def ed_components_from_selected_inverse(
     return ed
 
 
+def ed_components_from_schur_inverse(
+    S: sp.spmatrix,
+    blocks: List[BlockInfo],
+    G_blocks: Optional[Dict[str, np.ndarray]] = None,
+) -> Dict[str, float]:
+    """
+    Compute exact ED_k from Schur complement matrix S (random effects only).
+
+    This is a specialized version of ed_components_from_selected_inverse for use
+    with the Schur complement elimination of fixed effects. The Schur complement
+    S = Z'R^{-1}Z + G^{-1} - Z'R^{-1}X (X'R^{-1}X)^{-1} X'R^{-1}Z
+    corresponds to (C^{-1})_uu, the random-random block of the full inverse.
+
+    Parameters
+    ----------
+    S : scipy.sparse matrix
+        Schur complement matrix (random effects only), symmetric positive-definite
+    blocks : list of BlockInfo
+        Random effect block metadata with contiguous indices in S
+    G_blocks : dict, optional
+        Dictionary mapping block name to penalty/precision matrix G_k.
+        - If None: assumes G_k = I for all blocks
+        - If scalar: assumes G_k = scalar * I
+        - If 1D array: assumes G_k = diag(array)
+
+    Returns
+    -------
+    dict
+        Dictionary mapping random-effect block name -> ED_k value.
+
+    Notes
+    -----
+    When using Schur complement, the fixed effects are eliminated and only the
+    random effects remain. The inverse of S directly gives (C^{-1})_uu, so:
+
+        ED_k = m_k - tr(G_k^{-1} (S^{-1})_{kk})
+
+    This is mathematically equivalent to computing EDs from the full C matrix,
+    but more efficient since S is typically smaller and sparser.
+
+    See Also
+    --------
+    ed_components_from_selected_inverse : Full system version
+    """
+    # This is identical to the full version, just operating on S instead of C
+    # The mathematics is the same: we compute diag(S^{-1}) for random blocks
+    return ed_components_from_selected_inverse(S, blocks, G_blocks)
+
+
 def is_cholmod_available() -> bool:
     """
     Check if CHOLMOD is available.

@@ -17,6 +17,7 @@ multidimensional generalized P-splines: the SAP algorithm"
 """
 
 from __future__ import annotations
+import os
 import numpy as np
 import scipy.sparse as sp
 from dataclasses import dataclass, field
@@ -29,7 +30,11 @@ except ImportError:
     CHOLMOD_AVAILABLE = False
     cholesky = None
 
-from ..ed_selected_inverse import ed_components_from_selected_inverse, BlockInfo
+from ..ed_selected_inverse import ed_components_from_selected_inverse, ed_components_from_schur_inverse, BlockInfo
+from .schur import schur_reduce, schur_rhs, recover_beta
+
+# Environment flag to disable Schur complement (for debugging only)
+DISABLE_SCHUR = os.getenv("PYSPATS_DISABLE_SCHUR", "0") == "1"
 
 
 @dataclass
@@ -193,39 +198,98 @@ def fit_reml(
     ed_resid = 0.0
 
     for it in range(options.max_iter):
-        # 1) Assemble C(θ), rhs, and metadata for current variance components
-        C, rhs, blocks, rank_X, n, X, Z_dict = assemble_fn(theta)
+        # 1) Get design matrices and metadata for current variance components
+        _, _, blocks, rank_X, n, X, Z_dict = assemble_fn(theta)
 
-        # Ensure CSC format for CHOLMOD
-        if not sp.isspmatrix_csc(C):
-            C = C.tocsc()
+        # Build concatenated Z matrix (all random effects)
+        block_order = [b.name for b in blocks]
+        Z_list = [Z_dict[name] for name in block_order]
+        if Z_list:
+            Z = sp.hstack(Z_list, format="csc")
+        else:
+            Z = sp.csc_matrix((n, 0))
 
-        # 2) Factorize C(θ) once using CHOLMOD
-        try:
-            factor = cholesky(C)
-        except Exception as e:
-            raise RuntimeError(f"CHOLMOD factorization failed at iteration {it}: {e}")
+        y = assemble_fn.y
+        Rinv_scale = 1.0 / theta["eps"]
 
-        # 3) Solve mixed model equations: C(θ) * [β; u] = rhs
-        sol = factor(rhs)
-
-        # Extract β̂ and û using slices provided by assemble_fn
-        beta_hat = np.asarray(sol[assemble_fn.beta_slice]).ravel()
-
-        # Extract random effects per block
-        u_hat = {}
+        # Build G^{-1} blocks (each G_k^{-1} = (1/σ²_k) I_k)
+        Ginv_blocks = []
         for b in blocks:
-            # Adjust slice to account for β offset
-            global_slice = slice(
-                assemble_fn.random_slice.start + (b.start - blocks[0].start),
-                assemble_fn.random_slice.start + (b.stop - blocks[0].start)
-            )
-            u_hat[b.name] = np.asarray(sol[global_slice]).ravel()
+            lam_k = 1.0 / theta[b.name]
+            Ginv_blocks.append(sp.eye(b.size, format="csc") * lam_k)
 
-        # 4) Compute exact EDs using Takahashi selected inverse (reuses same factorization)
-        # Pass G_blocks as scalars (σ²_k for each block)
-        G_blocks = {b.name: theta[b.name] for b in blocks}
-        ed_k = ed_components_from_selected_inverse(C, blocks, G_blocks=G_blocks)
+        # Schur complement path (default) vs. full system (debug only)
+        if not DISABLE_SCHUR:
+            # **DEFAULT PATH: Schur complement**
+            # Eliminates fixed effects, factorizes sparse random block S only
+
+            # 2a) Build Schur complement S and precomputed parts
+            S, parts = schur_reduce(X, Z, Rinv_scale, Ginv_blocks)
+
+            # 2b) Compute reduced RHS
+            r, XtRinvy, ZtRinvy = schur_rhs(
+                X, Z, y, Rinv_scale,
+                parts["XtRinvX_inv"],
+                parts["XtRinvZ"]
+            )
+
+            # 3) Factorize S with CHOLMOD (sparse random block only)
+            try:
+                factor = cholesky(S)
+            except Exception as e:
+                raise RuntimeError(f"CHOLMOD factorization of Schur complement failed at iteration {it}: {e}")
+
+            # 4) Solve for random effects: S u = r
+            u_concat = factor(r)
+            u_concat = np.asarray(u_concat).ravel()
+
+            # 5) Recover fixed effects: β = (X'R^{-1}X)^{-1} [X'R^{-1}(y - Z u)]
+            beta_hat = recover_beta(X, y, Z, u_concat, Rinv_scale, parts["XtRinvX_inv"])
+
+            # Extract per-block random effects
+            u_hat = {}
+            for b in blocks:
+                u_hat[b.name] = u_concat[b.start:b.stop]
+
+            # 6) Compute exact EDs from S^{-1} (reuses same factorization)
+            # For Schur complement: (C^{-1})_uu = S^{-1}
+            G_blocks = {b.name: theta[b.name] for b in blocks}
+            ed_k = ed_components_from_schur_inverse(S, blocks, G_blocks=G_blocks)
+
+        else:
+            # **DEBUG PATH ONLY: Full system C (for numerical verification)**
+            # This path is only for testing/debugging via PYSPATS_DISABLE_SCHUR=1
+
+            # Assemble full C and rhs
+            C, rhs, _, _, _, _, _ = assemble_fn(theta)
+
+            # Ensure CSC format
+            if not sp.isspmatrix_csc(C):
+                C = C.tocsc()
+
+            # Factorize full C
+            try:
+                factor = cholesky(C)
+            except Exception as e:
+                raise RuntimeError(f"CHOLMOD factorization of full C failed at iteration {it}: {e}")
+
+            # Solve full system
+            sol = factor(rhs)
+
+            # Extract β̂ and û
+            beta_hat = np.asarray(sol[assemble_fn.beta_slice]).ravel()
+
+            u_hat = {}
+            for b in blocks:
+                global_slice = slice(
+                    assemble_fn.random_slice.start + (b.start - blocks[0].start),
+                    assemble_fn.random_slice.start + (b.stop - blocks[0].start)
+                )
+                u_hat[b.name] = np.asarray(sol[global_slice]).ravel()
+
+            # Compute EDs from full C
+            G_blocks = {b.name: theta[b.name] for b in blocks}
+            ed_k = ed_components_from_selected_inverse(C, blocks, G_blocks=G_blocks)
 
         # Residual effective dimension
         ed_sum = float(sum(ed_k.values()))

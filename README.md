@@ -42,10 +42,13 @@ This ensures clean variance decomposition and accurate effective dimension (ED) 
 
 pySpATS implements efficient **REML** (Restricted Maximum Likelihood) estimation:
 
-- **One CHOLMOD factorization per iteration**: Factorize C(θ) once, reuse for solving and ED computation
-- **Exact effective dimensions**: ED computed via Takahashi selected inverse (no approximations)
+- **Schur complement sparse/dense split** (default): Eliminates fixed-effects block analytically, factorizes only sparse random-effects system S with CHOLMOD
+- **One CHOLMOD factorization per iteration**: Factorize S(θ) once, reuse for solving and ED computation
+- **Exact effective dimensions**: ED computed via Takahashi selected inverse from S^{-1} (no approximations)
 - **Closed-form variance updates**: σ²_k = (u_k' u_k) / ED_k for random effects, σ²_ε = (e' e) / (n - rank(X)) for residuals
 - **Fast convergence**: Typically 10-20 iterations to convergence on field trial data
+
+The Schur complement approach is more efficient than factorizing the full mixed sparse-dense coefficient matrix C, especially when fixed effects are small and dense while random effects are large and sparse. A debug mode (`PYSPATS_DISABLE_SCHUR=1`) is available to fall back to the full system for numerical verification.
 
 This matches standard SpATS/LMMsolver practice with exact ED computation.
 

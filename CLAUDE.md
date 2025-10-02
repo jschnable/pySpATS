@@ -131,14 +131,22 @@ The SpATS model fitting follows this sequence:
 
 **`pyspats/reml/`**: REML optimizer with factorization reuse and ED-based updates
 - **`optimizer.py`**: Main REML estimation routine
-  - `fit_reml()`: Iterative REML with one CHOLMOD factorization per iteration
+  - `fit_reml()`: Iterative REML with Schur complement sparse/dense split (default)
   - `REMLOptions`: Configuration (max_iter, tolerances, verbosity)
   - `REMLResult`: Result container with variance components, EDs, and convergence status
+  - **Schur complement path** (default): Eliminates fixed-effects block, factorizes sparse S only
+  - **Full system path** (debug): Set `PYSPATS_DISABLE_SCHUR=1` to factorize full C for verification
+- **`schur.py`**: Schur complement utilities for efficient sparse/dense split
+  - `schur_reduce()`: Builds S = Z'R⁻¹Z + G⁻¹ - Z'R⁻¹X (X'R⁻¹X)⁻¹ X'R⁻¹Z
+  - `schur_rhs()`: Computes reduced RHS r = Z'R⁻¹y - Z'R⁻¹X (X'R⁻¹X)⁻¹ X'R⁻¹y
+  - `recover_beta()`: Recovers β = (X'R⁻¹X)⁻¹ [X'R⁻¹(y - Z u)]
+  - More efficient than full C when fixed effects are small/dense and random effects are large/sparse
 - **`assembly_adapter.py`**: Mixed model assembly utilities
   - `make_assemble_fn()`: Wraps design builders to create C(θ) and RHS
   - `make_builder_from_psanova()`: Convenience builder for PS-ANOVA designs
 - **Key features**:
-  - Reuses CHOLMOD factorization for solving and ED computation
+  - One CHOLMOD factorization per iteration (Schur S or full C)
+  - Reuses factorization for solving and exact ED computation
   - Closed-form variance updates: σ²_k = (u_k' u_k) / ED_k
   - No stochastic approximations; fully deterministic
   - Typically converges in 10-20 iterations
