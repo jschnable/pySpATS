@@ -104,7 +104,30 @@ sudo apt-get install libsuitesparse-dev
 pip install scikit-sparse
 ```
 
-If scikit-sparse is not available, pySpATS will use approximate ED calculations.
+**If CHOLMOD isn't installed**, pySpATS will still work but use approximate ED calculations. You'll see this warning:
+
+```
+UserWarning: scikit-sparse not available. Exact ED computation requires CHOLMOD.
+Install with: pip install scikit-sparse (requires SuiteSparse system library).
+Falling back to approximate ED = nominal parameter count.
+```
+
+To install CHOLMOD:
+
+**macOS:**
+```bash
+brew install suite-sparse
+pip install scikit-sparse
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libsuitesparse-dev
+pip install scikit-sparse
+```
+
+**Windows:**
+CHOLMOD installation on Windows is more involved. For most use cases, the approximate EDs are sufficient. If exact EDs are critical, consider using WSL (Windows Subsystem for Linux) or a Docker container.
 
 ## Quick Start
 

@@ -7,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pySpATS",
-    version="0.1",
+    version="0.2.0",
     author="James Schnable Lab",
     author_email="jschnable@unl.edu", 
     description="Python implementation of Spatial Analysis of Field Trials with Splines (SpATS)",
