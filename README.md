@@ -120,6 +120,83 @@ predictions if predictors and fitted factor levels are available. Missing
 predictors yield NaN. No input DataFrame or global random seed is modified.
 The `used_for_fit` output column makes exclusions explicit.
 
+## Three standard tables
+
+```python
+plot_values = result.adjusted_plots()
+genotype_values = result.genotype_means()
+variance = result.variance_partition()
+
+# Use identical overrides when comparing plot and genotype outputs:
+reference = {"treatment": "irrigated", "flowering_time": 65}
+# These must be fitted fixed covariates with valid levels/values.
+# plot_values = result.adjusted_plots(reference=reference)
+# genotype_values = result.genotype_means(reference=reference)
+```
+
+The shared default reference averages fixed categorical levels equally, uses
+numeric covariate means over observed positive-weight plots, averages the spatial
+surface equally over those plots, and sets other random effects to zero. Known
+offsets use their mean; `reference_offset=0` (or another value) overrides this.
+Every genotype uses the same reference, regardless of its occupied locations.
+These outputs currently support Gaussian models.
+
+`genotype_means()` returns `environment`, `trait`, `genotype`, `predicted`, `se`,
+`n_obs`, and `type`. Predictions include the reference phenotype level; random
+genotypes retain shrinkage. SEs include covariance with the reference, conditional
+on estimated variance parameters. They describe mean estimation/prediction error,
+not the spread of future plot observations.
+
+`adjusted_plots()` returns original-order rows and index, with `environment`,
+`trait`, `plot_id` (zero-based input position), `genotype`, `observed`, `fitted`,
+`residual`, `predicted_at_reference`, `adjusted`, and `used_for_fit`.
+**Adjusted = predicted_at_reference + observed - fitted**. Thus all nuisance
+effects are standardized while genotype differences and plot residuals remain.
+Missing observations remain missing in `adjusted`; predictions are separate.
+Original input columns remain available in `result.data` and can be joined by
+row position even when the original index is duplicated.
+
+Both tables store the resolved reference and convergence status in `.attrs`.
+CSV does not preserve attrs; save that metadata alongside exported tables.
+Environment and trait columns allow concatenation across independently fitted
+fields without implying that they were fitted jointly. Existing `to_frame()`
+continues to provide its spatial-only adjustment.
+
+## Variance partitioning
+
+```python
+result = fit_trial(
+    data=plots, response="yield", genotype="geno",
+    spatial=PSANOVA("col", "row"), genotype_as_random=True,
+    environment_id="wheat_trial",
+)
+partition = result.variance_partition()
+spatial_details = result.variance_partition(spatial="components")
+partition.to_csv("variance_partition.csv", index=False)
+```
+
+Both tables contain `environment`, `trait`, `component`, `role`, `variance`,
+and `percent`. Random-effect and residual percentages sum to 100. Ordinary
+random intercept factors contribute their estimated variance; splines contribute
+average plot-level variance, `trace(Z G Z') / n`, using the fitted prior
+coefficient covariance. This puts them on the same squared-phenotype scale.
+The calculation uses bounded chunks and never constructs a plot-by-plot
+covariance matrix. Detailed spatial rows replace the combined spatial row.
+
+Fixed effects are listed with missing variance and percentage: like fixed terms
+in an lme4 model, they have no estimated variance component. This includes
+fixed genotypes and the unpenalized spatial polynomial. Thus the denominator
+is **random effects plus residual**, not the sample variance of the observations.
+The report currently supports Gaussian models. Each observed positive-weight
+plot counts equally; weighted residual variance is the average of `psi / weight`.
+Spatial contributions use the fitted basis and its centering setting.
+`partition.attrs` records total variance, plot count and convergence status.
+
+`environment_id` labels a single fitted field; it does not introduce an
+environment effect. `fit_trials` supplies this label from its grouping key
+(a tuple when grouping by multiple columns), so reports can be concatenated
+across fields and traits. Joint multi-environment estimation is not yet supported.
+
 ## Prediction and plotting
 
 ```python

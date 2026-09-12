@@ -43,6 +43,10 @@ class SpATS:
         mixed models (approximate inference, not exact GLMM likelihood).
     control : SpATSControl, optional
         Iteration tolerance, limit and monitoring.
+    environment_id : hashable, default='environment_1'
+        Label for this single physical field/trial in standard output tables.
+        It is metadata, not a model term or a grouping operation. The batch
+        API fills it from the by-column values automatically.
 
     Notes
     -----
@@ -65,9 +69,17 @@ class SpATS:
         offset=None,
         weights=None,
         control: SpATSControl | None = None,
+        environment_id="environment_1",
     ):
         if not isinstance(data, pd.DataFrame):
             raise ValueError("data must be a pandas DataFrame")
+        try:
+            hash(environment_id)
+        except TypeError as exc:
+            raise TypeError(
+                "environment_id must be a hashable field identifier"
+            ) from exc
+        self.environment_id = environment_id
         self.response, self.genotype, self.spatial = response, genotype, spatial
         self.spec = spatial_spec(spatial)
         self.genotype_as_random = bool(genotype_as_random)
@@ -513,6 +525,44 @@ class SpATS:
         if self.adjusted_values is not None:
             result["adjusted"] = self.adjusted_values
         return result
+
+    def genotype_means(self, *, reference=None, reference_offset=None) -> pd.DataFrame:
+        """Genotype values and SEs at balanced reference conditions.
+
+        Override fixed covariates with reference={"treatment": "irrigated"}.
+        See pyspats.outputs.genotype_means for reference and uncertainty details.
+        """
+        from .outputs import genotype_means
+
+        return genotype_means(
+            self, reference=reference, reference_offset=reference_offset
+        )
+
+    def adjusted_plots(self, *, reference=None, reference_offset=None) -> pd.DataFrame:
+        """All-covariate adjusted plots, preserving genotype and plot residuals.
+
+        Uses the same reference arguments as genotype_means(). Includes original
+        row positions and index, observed values and separate reference predictions.
+        """
+        from .outputs import adjusted_plots
+
+        return adjusted_plots(
+            self, reference=reference, reference_offset=reference_offset
+        )
+
+    def variance_partition(self, *, spatial="total") -> pd.DataFrame:
+        """Variance and percentage assigned to random factors, spatial effects and residual.
+
+        Spline variances are converted to squared phenotype units using
+        trace(Z G Z') / n over fitted plots. ``spatial="components"`` separates
+        the spline covariance blocks; the default combines them. Fixed effects
+        are listed with missing variance/percent, because they do not have
+        estimated variance parameters. The denominator excludes fixed effects.
+        Gaussian models only. See :mod:`pyspats.outputs` for the full definition.
+        """
+        from .outputs import variance_partition
+
+        return variance_partition(self, spatial=spatial)
 
     def summary(self, which: str = "all") -> pd.DataFrame:
         """Return a table suitable for logs, notebooks and CSV export."""

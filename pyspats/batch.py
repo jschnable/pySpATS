@@ -23,7 +23,14 @@ def _run(task):
     key, response, data, options, on_error = task
     try:
         return TrialFit(
-            key, response, fit_trial(data=data, response=response, **options)
+            key,
+            response,
+            fit_trial(
+                data=data,
+                response=response,
+                environment_id=key[0] if len(key) == 1 else key,
+                **options,
+            ),
         )
     except Exception as exc:
         if on_error == "raise":
@@ -43,8 +50,14 @@ def fit_trials(*, data, by, responses, workers=1, on_error="raise", **options):
     ``on_error='record'`` yields error text alongside successful results;
     numerical nonconvergence is represented by ``record.ok == False`` while
     retaining the model and iteration history. No rows or failed jobs vanish.
-    These are separate single-field models, not a multi-environment analysis.
+    The model's environment_id is set from the by-column values (a tuple for
+    multiple columns); do not pass environment_id separately. These are separate
+    single-field models, not a joint multi-environment analysis.
     """
+    if "environment_id" in options:
+        raise ValueError(
+            "fit_trials derives environment_id from by; do not supply it separately"
+        )
     by = [by] if isinstance(by, str) else list(by)
     responses = [responses] if isinstance(responses, str) else list(responses)
     if not by or not responses or len(set(responses)) != len(responses):
