@@ -1,57 +1,36 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pySpATS"
-version = "0.1"
-description = "Python implementation of Spatial Analysis of Field Trials with Splines (SpATS)"
+version = "0.3.0"
+description = "Spatial correction of field trials with R-validated tensor P-spline mixed models"
 readme = "README.md"
-license = {text = "GPL-2.0"}
-authors = [
-    {name = "James Schnable Lab", email = "jschnable@unl.edu"},
-]
-maintainers = [
-    {name = "James Schnable Lab", email = "jschnable@unl.edu"},
-]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Bio-Informatics",
-    "Topic :: Scientific/Engineering :: Information Analysis",
-]
-keywords = ["spatial analysis", "field trials", "splines", "agriculture", "plant breeding", "mixed models"]
-dependencies = [
-    "numpy>=1.20.0",
-    "pandas>=1.3.0", 
-    "scipy>=1.7.0",
-    "matplotlib>=3.3.0",
-    "scikit-learn>=1.0.0",
-]
-requires-python = ">=3.8"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+authors = [{name = "James Schnable Lab", email = "jschnable@unl.edu"}]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23", "pandas>=1.5", "scipy>=1.9"]
 
 [project.optional-dependencies]
-spatial = ["scikit-sparse>=0.4.14"]
+plot = ["matplotlib>=3.6"]
+test = ["pytest>=7", "matplotlib>=3.6"]
 
 [project.urls]
-"Homepage" = "https://github.com/schnablelab/python-spats"
-"Bug Reports" = "https://github.com/schnablelab/python-spats/issues"
-"Source" = "https://github.com/schnablelab/python-spats"
-
-[tool.setuptools]
-package-dir = {"" = "."}
+Source = "https://github.com/jschnable/pySpATS"
+Issues = "https://github.com/jschnable/pySpATS/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pyspats*"]
+exclude = ["pyspats.reml*", "pyspats.spatial*"]
 
 [tool.setuptools.package-data]
-pyspats = ["*.py"]
+pyspats = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.format]
+line-ending = "lf"

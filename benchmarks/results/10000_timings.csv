@@ -1,0 +1,13 @@
+language,random,run,seconds,iterations
+Python,False,1,0.5681684999726713,71
+Python,False,2,0.3899549579946324,71
+Python,False,3,0.3783216669689864,71
+Python,True,1,0.6515336671145633,121
+Python,True,2,0.5664564999751747,121
+Python,True,3,0.5764353750273585,121
+R,False,1,1.812,71
+R,False,2,1.385,71
+R,False,3,1.129,71
+R,True,1,6.091,121
+R,True,2,6.271,121
+R,True,3,5.934,121

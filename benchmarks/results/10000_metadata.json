@@ -1,0 +1,34 @@
+{
+  "pyspats": "0.3.0",
+  "python": "3.14.7",
+  "numpy": "2.5.1",
+  "scipy": "1.18.0",
+  "pandas": "3.0.5",
+  "platform": "macOS-26.2-arm64-arm-64bit-Mach-O",
+  "thread_environment": {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1"
+  },
+  "max_absolute_fitted_difference": {
+    "FALSE": 1.1161205293319654e-10,
+    "TRUE": 6.392042450897861e-11
+  },
+  "r": "4.6.1 (2026-06-24)",
+  "r_spats": "1.0-20",
+  "cpu": "Apple M5",
+  "plots": 10000,
+  "genotypes": 2000,
+  "repeats": 3,
+  "nseg": [
+    10,
+    10
+  ],
+  "nest_div": [
+    2,
+    2
+  ],
+  "tolerance": 1e-06,
+  "max_iter": 500
+}

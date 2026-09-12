@@ -1,1003 +1,582 @@
-"""
-Core SpATS implementation for spatial analysis of field trials.
-"""
+"""Field-trial spatial mixed models with the R SpATS statistical specification."""
 
+import warnings
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from scipy.sparse.linalg import spsolve, LinearOperator
-from scipy.linalg import cholesky, solve_triangular
-from scipy.stats import norm
-import warnings
-from typing import Optional, Union, List, Dict, Tuple, Any
-
 from .control import SpATSControl
-from .basis import construct_2d_pspline, construct_design_matrix
 from .families import Family, gaussian
-from .solver import SAP_solver
-from .utils import interpret_formula, get_heritability
-from . import plotting
-from .psanova_basis import build_psanova_design
-from .ed_selected_inverse import BlockInfo
-from .spatial.block_operator import ConcatenatedBlockOperator, BlockLinearOperator
+from .model_basis import SpatialBasis, SpatialSpec, spatial_spec
+from .engine import fit_mixed, ConvergenceWarning
 
 
 class SpATS:
-    """
-    Spatial Analysis of Field Trials with Splines
-    
-    Fits a (generalised) linear mixed model with spatial trends modelled 
-    using two-dimensional P-splines.
-    
+    """Fit a spatial mixed model to one field and one response.
+
     Parameters
     ----------
-    response : str
-        Name of the response variable column in data
-    genotype : str
-        Name of the genotype/variety column in data (must be categorical)
-    spatial : tuple or str
-        Spatial coordinates specification as (x_coord, y_coord) or formula
-    genotype_as_random : bool, default=False
-        Whether to treat genotype as random effect
+    response, genotype : str
+        Data columns. Genotype IDs are categorical even when stored as numbers.
+    spatial : tuple[str, str] or SpatialSpec
+        ``('col', 'row')`` uses PSANOVA with 10 segments per axis. Use
+        ``PSANOVA('col', 'row', nseg=(20, 30), nest_div=2)`` to configure it.
+    data : pandas.DataFrame
+        One row per plot. Input is copied. Missing responses are excluded from
+        estimation but predicted where predictors are complete. Missing
+        predictors yield NaN predictions. Original row order/index are retained.
+    genotype_as_random : bool
+        False estimates genotype effects (BLUEs); True predicts effects with
+        shrinkage (BLUPs) and permits generalized heritability estimation.
+    fixed, random : sequence[str], optional
+        Additive columns. Numeric fixed columns are covariates; other fixed
+        columns and all random columns are categorical. Formula strings are
+        intentionally unsupported. Cast numeric treatment codes to category.
     geno_decomp : str, optional
-        Factor variable for genotype grouping (when genotype is random)
-    fixed : list of str, optional
-        Fixed effect variables
-    random : list of str, optional
-        Random effect variables (must be categorical)
-    data : pd.DataFrame
-        Input data containing all variables
-    family : Family, default=gaussian()
-        Distribution family and link function
-    offset : array-like, optional
-        Known offset to include in linear predictor
-    weights : array-like, optional
-        Observation weights (default: all ones)
+        Genotype population column: estimates separate genotype variances.
+        Each genotype must belong to exactly one population.
+    weights : array-like or column name, optional
+        Nonnegative precision weights. Gaussian residual variance is psi/weight.
+        Zero weights exclude a plot from fitting; they do not mean a zero trait.
+    offset : scalar, array-like or column name, optional
+        Known contribution on the link scale, subtracted before fitting.
+    family : Family, optional
+        Gaussian by default. Poisson/log and binomial/logit use R-style working
+        mixed models (approximate inference, not exact GLMM likelihood).
     control : SpATSControl, optional
-        Algorithm control parameters
-        
-    Attributes
-    ----------
-    fitted_values : np.ndarray
-        Fitted values from the model
-    residuals : np.ndarray
-        Deviance residuals
-    coefficients : np.ndarray
-        Estimated coefficients (fixed and random)
-    var_comp : dict
-        Variance component estimates
-    effective_dim : dict
-        Effective dimensions for each model component
-    deviance : float
-        Model deviance at convergence
+        Iteration tolerance, limit and monitoring.
+
+    Notes
+    -----
+    Construction fits immediately for compatibility. ``fit_trial`` is a
+    keyword-only function with the same result. Covariance and prediction SEs
+    condition on fitted variance parameters; they omit smoothing uncertainty.
     """
-    
+
     def __init__(
         self,
         response: str,
         genotype: str,
-        spatial: Union[Tuple[str, str], str],
+        spatial: SpatialSpec | tuple[str, str] | dict,
         data: pd.DataFrame,
         genotype_as_random: bool = False,
-        geno_decomp: Optional[str] = None,
-        fixed: Optional[List[str]] = None,
-        random: Optional[List[str]] = None,
-        family: Family = gaussian(),
-        offset: Optional[np.ndarray] = None,
-        weights: Optional[np.ndarray] = None,
-        control: Optional[SpATSControl] = None
+        geno_decomp: str | None = None,
+        fixed: list[str] | None = None,
+        random: list[str] | None = None,
+        family: Family | None = None,
+        offset=None,
+        weights=None,
+        control: SpATSControl | None = None,
     ):
-        self.response = response
-        self.genotype = genotype
-        self.spatial = spatial
-        self.genotype_as_random = genotype_as_random
-        self.geno_decomp = geno_decomp
-        self.fixed = fixed or []
-        self.random = random or []
-        self.family = family
-        self.control = control or SpATSControl()
-        
-        # Validate inputs first
-        self._validate_inputs(data)
-        self.data = data.copy()
-        
-        # Set up weights and offset
-        n_obs = len(self.data)
-        self.weights = np.ones(n_obs) if weights is None else np.asarray(weights)
-        self.offset = np.zeros(n_obs) if offset is None else np.asarray(offset)
-        
-        # Handle missing values
-        self._handle_missing_data()
-        
-        # Check and clean covariates
-        self._check_and_clean_covariates()
-        
-        # Fit the model
-        self._fit_model()
-    
-    def _validate_inputs(self, data):
-        """Validate input parameters and data."""
         if not isinstance(data, pd.DataFrame):
             raise ValueError("data must be a pandas DataFrame")
-            
-        required_cols = [self.response, self.genotype]
-        if isinstance(self.spatial, tuple):
-            required_cols.extend(self.spatial)
-        required_cols.extend(self.fixed)
-        required_cols.extend(self.random)
-        if self.geno_decomp:
-            required_cols.append(self.geno_decomp)
-            
-        missing_cols = [col for col in required_cols if col not in data.columns]
-        if missing_cols:
-            raise ValueError(f"Missing columns in data: {missing_cols}")
-            
-        # Check that genotype is categorical
-        if not pd.api.types.is_categorical_dtype(data[self.genotype]) and \
-           not data[self.genotype].dtype == 'object':
-            warnings.warn(f"Converting {self.genotype} to categorical")
-            data[self.genotype] = data[self.genotype].astype('category')
-            
-        # Check random effects are categorical
-        for col in self.random:
-            if not pd.api.types.is_categorical_dtype(data[col]) and \
-               not data[col].dtype == 'object':
-                warnings.warn(f"Converting {col} to categorical")
-                data[col] = data[col].astype('category')
-    
-    def _check_and_clean_covariates(self):
-        """
-        Check covariates for sufficient variation and remove problematic ones.
-        Provides informative messages about removed factors.
-        """
-        import warnings
-        
-        # Check fixed effects
-        fixed_to_remove = []
-        
-        for factor in self.fixed[:]:  # Create copy to modify during iteration
-            if factor in self.data.columns:
-                # Get valid (non-NA) values for this factor
-                valid_values = self.data[factor].dropna()
-                
-                # Check for sufficient levels
-                if pd.api.types.is_categorical_dtype(valid_values) or valid_values.dtype == 'object':
-                    unique_levels = valid_values.nunique()
-                    if unique_levels < 2:
-                        warnings.warn(f"Fixed effect '{factor}' has insufficient levels ({unique_levels}). Removing from model.")
-                        fixed_to_remove.append(factor)
-                        continue
-                        
-                # Check for zero variance (for numeric factors)
-                elif pd.api.types.is_numeric_dtype(valid_values):
-                    if valid_values.std() == 0:
-                        warnings.warn(f"Fixed effect '{factor}' has zero variance. Removing from model.")
-                        fixed_to_remove.append(factor)
-                        continue
-                        
-                # Check if factor becomes problematic after subsetting to valid observations
-                if hasattr(self, 'valid_obs'):
-                    subset_values = self.data[factor][self.valid_obs].dropna()
-                    if len(subset_values) == 0:
-                        warnings.warn(f"Fixed effect '{factor}' has no valid observations. Removing from model.")
-                        fixed_to_remove.append(factor)
-                        continue
-                    elif pd.api.types.is_categorical_dtype(subset_values) or subset_values.dtype == 'object':
-                        subset_levels = subset_values.nunique()
-                        if subset_levels < 2:
-                            warnings.warn(f"Fixed effect '{factor}' has insufficient levels after subsetting ({subset_levels}). Removing from model.")
-                            fixed_to_remove.append(factor)
-                            continue
-        
-        # Remove problematic fixed effects
-        for factor in fixed_to_remove:
-            self.fixed.remove(factor)
-            
-        # Check random effects
-        random_to_remove = []
-        
-        for factor in self.random[:]:  # Create copy to modify during iteration
-            if factor in self.data.columns:
-                # Get valid (non-NA) values for this factor
-                valid_values = self.data[factor].dropna()
-                
-                # Random effects must be categorical
-                if not (pd.api.types.is_categorical_dtype(valid_values) or valid_values.dtype == 'object'):
-                    warnings.warn(f"Random effect '{factor}' is not categorical. Converting to categorical.")
-                    self.data[factor] = self.data[factor].astype('category')
-                    valid_values = self.data[factor].dropna()
-                
-                # Check for sufficient levels
-                unique_levels = valid_values.nunique()
-                if unique_levels < 2:
-                    warnings.warn(f"Random effect '{factor}' has insufficient levels ({unique_levels}). Removing from model.")
-                    random_to_remove.append(factor)
-                    continue
-                    
-                # Check if factor becomes problematic after subsetting to valid observations  
-                if hasattr(self, 'valid_obs'):
-                    subset_values = self.data[factor][self.valid_obs].dropna()
-                    if len(subset_values) == 0:
-                        warnings.warn(f"Random effect '{factor}' has no valid observations. Removing from model.")
-                        random_to_remove.append(factor)
-                        continue
-                    else:
-                        subset_levels = subset_values.nunique()
-                        if subset_levels < 2:
-                            warnings.warn(f"Random effect '{factor}' has insufficient levels after subsetting ({subset_levels}). Removing from model.")
-                            random_to_remove.append(factor)
-                            continue
-        
-        # Remove problematic random effects
-        for factor in random_to_remove:
-            self.random.remove(factor)
-            
-        # Inform user of final model specification
-        if fixed_to_remove or random_to_remove:
-            print("SpATS model updated:")
-            print(f"  Fixed effects: {self.fixed if self.fixed else 'None'}")
-            print(f"  Random effects: {self.random if self.random else 'None'}")
-    
-    def _handle_missing_data(self):
-        """Handle missing values in predictors and response."""
-        # Identify rows with missing predictors
-        predictor_cols = [self.genotype]
-        if isinstance(self.spatial, tuple):
-            predictor_cols.extend(self.spatial)
-        predictor_cols.extend(self.fixed)
-        predictor_cols.extend(self.random)
-        if self.geno_decomp:
-            predictor_cols.append(self.geno_decomp)
-            
-        missing_predictors = self.data[predictor_cols].isnull().any(axis=1)
-        missing_response = self.data[self.response].isnull()
-        
-        # Update weights to handle missing data
-        self.weights = self.weights * (~missing_predictors) * (~missing_response)
-        
-        # Store original indices
-        self.valid_obs = ~missing_predictors
-        self.n_obs = np.sum(self.weights > 0)
-        
-    def _fit_model(self):
-        """Main model fitting procedure."""
-        if self.control.monitoring:
-            print("Starting SpATS model fitting...")
-            
-        # Construct design matrices
-        design_info = self._construct_design_matrices()
-        
-        # Initialize parameters
-        y = self.data[self.response].values[self.valid_obs]
-        n_params = design_info['X'].shape[1] + design_info['Z'].shape[1]
-        
-        # Initialize coefficients and variance components
-        beta = np.zeros(design_info['X'].shape[1])
-        u = np.zeros(design_info['Z'].shape[1])
-        lambda_params = np.ones(len(design_info['penalty_matrices']) + 1)
-        
-        # Initialize linear predictor and mean
-        eta = design_info['X'] @ beta + design_info['Z'] @ u + self.offset[self.valid_obs]
-        mu = self.family.inverse_link(eta)
-        
-        # Main iteration loop
-        deviance_old = np.inf
-        
-        for iteration in range(self.control.max_iter):
-            # Update working variables
-            mu_eta = self.family.d_inverse_link(eta)
-            var_mu = self.family.variance(mu)
-            
-            # Working response and weights
-            z = eta + (y - mu) / mu_eta
-            w = (mu_eta ** 2) / var_mu * self.weights[self.valid_obs]
-            
-            # Solve mixed model equations
-            solution = self._solve_mixed_model_equations(
-                design_info, z, w, lambda_params
+        self.response, self.genotype, self.spatial = response, genotype, spatial
+        self.spec = spatial_spec(spatial)
+        self.genotype_as_random = bool(genotype_as_random)
+        self.geno_decomp = geno_decomp
+        self.fixed, self.random = self._terms(fixed), self._terms(random)
+        self.family = gaussian() if family is None else family
+        if self.family.family not in ("gaussian", "poisson", "binomial"):
+            raise NotImplementedError(
+                "Supported families are Gaussian, Poisson and binomial"
             )
-            
-            beta = solution['beta']
-            u = solution['u'] 
-            lambda_params = solution['lambda']
-            
-            # Update linear predictor
-            eta = design_info['X'] @ beta + design_info['Z'] @ u + self.offset[self.valid_obs]
-            mu = self.family.inverse_link(eta)
-            
-            # Check convergence
-            deviance = self._compute_deviance(y, mu, w)
-            
-            if self.control.monitoring:
-                print(f"Iteration {iteration + 1}: Deviance = {deviance:.6f}")
-                
-            if abs(deviance_old - deviance) < self.control.tolerance:
-                break
-                
-            deviance_old = deviance
-            
-            # For Gaussian with identity link, converge after one iteration
-            if self.family.family == 'gaussian' and self.family.link == 'identity':
-                break
-        
-        # Store results
-        self._store_results(design_info, beta, u, lambda_params, mu, deviance, iteration + 1)
-        
-    def _construct_design_matrices(self) -> Dict[str, Any]:
-        """Construct design matrices for fixed and random effects using PS-ANOVA decomposition."""
-        valid_data = self.data[self.valid_obs]
-
-        # PS-ANOVA decomposition for spatial component
-        # Fixed polynomial: [1, r, c]
-        # Random smooths: row-smooth, col-smooth, interaction (orthogonal to polynomial)
-        spatial_blocks = []
-        n_geno_fixed = None
-        n_geno_random = None
-
-        if isinstance(self.spatial, tuple):
-            x_coord, y_coord = self.spatial
-            r_vals = valid_data[x_coord].values
-            c_vals = valid_data[y_coord].values
-
-            # Build PS-ANOVA design with explicit polynomial fixed effects
-            # and orthogonal random smooths
-            X_poly, Z_r, Z_c, Z_rc, spatial_blocks = build_psanova_design(
-                r_vals, c_vals,
-                nkr=10,  # Default knots for row
-                nkc=10,  # Default knots for column
-                degree=3
+        if geno_decomp and not genotype_as_random:
+            raise ValueError("geno_decomp requires genotype_as_random=True")
+        self.control = control or SpATSControl()
+        self.data = data.copy(deep=True)
+        required = list(
+            dict.fromkeys(
+                [response, genotype, self.spec.x, self.spec.y]
+                + self.fixed
+                + self.random
+                + ([geno_decomp] if geno_decomp else [])
             )
-
-            # Fixed effects: start with polynomial part
-            X_parts = [X_poly]
-        else:
-            # No spatial component - just intercept
-            X_parts = [np.ones((len(valid_data), 1))]
-
-        # Genotype (if fixed)
-        if not self.genotype_as_random:
-            geno_dummies = pd.get_dummies(valid_data[self.genotype], drop_first=True)
-            X_parts.append(geno_dummies.values)
-            # Track number of genotypes (including baseline)
-            n_geno_fixed = valid_data[self.genotype].nunique()
-
-        # Other fixed effects
-        for var in self.fixed:
-            if valid_data[var].dtype in ['object', 'category']:
-                dummies = pd.get_dummies(valid_data[var], drop_first=True)
-                X_parts.append(dummies.values)
-            else:
-                X_parts.append(valid_data[var].values.reshape(-1, 1))
-
-        X = np.hstack(X_parts) if X_parts else np.ones((len(valid_data), 1))
-
-        # Random effects design matrix
-        Z_parts = []
-        penalty_matrices = []
-        block_info = []  # Track block metadata for ED computation
-
-        # Add spatial random smooths (already whitened, so penalty = identity)
-        if isinstance(self.spatial, tuple):
-            current_idx = 0
-            for Z_block, block in zip([Z_r, Z_c, Z_rc], spatial_blocks):
-                if Z_block.shape[1] > 0:
-                    Z_parts.append(Z_block)
-                    # Penalty is identity (already whitened)
-                    penalty_matrices.append(sparse.eye(Z_block.shape[1]))
-                    # Update block indices to account for global position
-                    block_info.append(BlockInfo(
-                        name=block.name,
-                        start=current_idx,
-                        stop=current_idx + Z_block.shape[1],
-                        is_random=True
-                    ))
-                    current_idx += Z_block.shape[1]
-
-        # Genotype (if random)
-        if self.genotype_as_random:
-            geno_dummies = pd.get_dummies(valid_data[self.genotype], drop_first=False)
-            Z_parts.append(geno_dummies.values)
-            # Add identity penalty for genotype random effects
-            n_geno_random = geno_dummies.shape[1]
-            penalty_matrices.append(sparse.eye(n_geno_random))
-            block_info.append(BlockInfo(
-                name='genotype',
-                start=current_idx,
-                stop=current_idx + n_geno_random,
-                is_random=True
-            ))
-            current_idx += n_geno_random
-
-        # Other random effects
-        for var in self.random:
-            dummies = pd.get_dummies(valid_data[var], drop_first=False)
-            n_levels = dummies.shape[1]
-            Z_parts.append(dummies.values)
-            # Add identity penalty
-            penalty_matrices.append(sparse.eye(n_levels))
-            block_info.append(BlockInfo(
-                name=var,
-                start=current_idx,
-                stop=current_idx + n_levels,
-                is_random=True
-            ))
-            current_idx += n_levels
-
-        # Handle Z matrix construction - may contain LinearOperators from Kronecker path
-        if Z_parts:
-            # Check if any parts are LinearOperators
-            has_linear_operators = any(isinstance(z, LinearOperator) for z in Z_parts)
-
-            if has_linear_operators:
-                # Use ConcatenatedBlockOperator for mixed dense/LinearOperator blocks
-                wrapped_blocks = []
-                for z_block, block in zip(Z_parts, block_info):
-                    wrapped_blocks.append(BlockLinearOperator(z_block, block.name))
-                Z = ConcatenatedBlockOperator(wrapped_blocks, block_info)
-            else:
-                # All dense - use normal hstack
-                Z = np.hstack(Z_parts)
-        else:
-            Z = np.zeros((len(valid_data), 0))
-
-        return {
-            'X': X,
-            'Z': Z,
-            'penalty_matrices': penalty_matrices,
-            'block_info': block_info,  # Add block metadata
-            'valid_data': valid_data,
-            'n_geno_fixed': n_geno_fixed,
-            'n_geno_random': n_geno_random
-        }
-    
-    def _solve_mixed_model_equations(self, design_info, z, w, lambda_params):
-        """Solve mixed model equations using SAP algorithm."""
-        X = design_info['X']
-        Z = design_info['Z']
-        penalties = design_info['penalty_matrices']
-
-        # Convert LinearOperator to dense array if needed (for compatibility with simplified solver)
-        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
-            # Materialize the full matrix for this simple solver
-            # (The REML optimizer path handles LinearOperators efficiently)
-            n_obs = X.shape[0]
-            n_random = Z.shape[1]
-            Z_dense = np.zeros((n_obs, n_random))
-            for j in range(n_random):
-                e_j = np.zeros(n_random)
-                e_j[j] = 1.0
-                Z_dense[:, j] = Z @ e_j
-            Z = Z_dense
-
-        # Weight matrices
-        W = sparse.diags(w)
-        
-        # Construct penalty matrix
-        G_inv = sparse.block_diag([lambda_params[i+1] * P for i, P in enumerate(penalties)])
-        
-        # Mixed model equations
-        # [X'WX   X'WZ] [beta] = [X'Wz]
-        # [Z'WX  Z'WZ + G_inv] [u]     [Z'Wz]
-        
-        XtWX = X.T @ W @ X
-        XtWZ = X.T @ W @ Z
-        ZtWX = Z.T @ W @ X  
-        ZtWZ = Z.T @ W @ Z
-        
-        XtWz = X.T @ W @ z
-        ZtWz = Z.T @ W @ z
-        
-        # Construct coefficient matrix
-        if Z.shape[1] > 0:
-            coeff_matrix = sparse.bmat([
-                [XtWX, XtWZ],
-                [ZtWX, ZtWZ + G_inv]
-            ]).tocsr()
-            rhs = np.concatenate([XtWz, ZtWz])
-        else:
-            coeff_matrix = XtWX
-            rhs = XtWz
-            
-        # Solve system
-        try:
-            solution = spsolve(coeff_matrix, rhs)
-        except:
-            # Fallback to dense solver with regularization
-            try:
-                coeff_dense = coeff_matrix.toarray()
-                # Add small regularization to diagonal
-                np.fill_diagonal(coeff_dense, coeff_dense.diagonal() + 1e-8)
-                solution = np.linalg.solve(coeff_dense, rhs)
-            except:
-                # Last resort: use least squares
-                solution, _, _, _ = np.linalg.lstsq(coeff_matrix.toarray(), rhs, rcond=None)
-            
-        if Z.shape[1] > 0:
-            beta = solution[:X.shape[1]]
-            u = solution[X.shape[1]:]
-        else:
-            beta = solution
-            u = np.array([])
-            
-        # Update variance components (simplified REML estimation)
-        new_lambda = self._update_variance_components(
-            design_info, beta, u, z, w, lambda_params
         )
-        
-        return {
-            'beta': beta,
-            'u': u, 
-            'lambda': new_lambda
-        }
-    
-    def _update_variance_components(self, design_info, beta, u, z, w, lambda_params):
-        """Update variance components using REML."""
-        # Simplified variance component update
-        # In practice, this would use the full REML equations
-
-        X = design_info['X']
-        Z = design_info['Z']
-
-        # Convert LinearOperator to dense array if needed
-        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
-            n_obs = X.shape[0]
-            n_random = Z.shape[1]
-            Z_dense = np.zeros((n_obs, n_random))
-            for j in range(n_random):
-                e_j = np.zeros(n_random)
-                e_j[j] = 1.0
-                Z_dense[:, j] = Z @ e_j
-            Z = Z_dense
-
-        # Residuals
-        residuals = z - X @ beta - Z @ u
-        
-        # Residual sum of squares
-        rss = np.sum(w * residuals**2)
-        
-        # Degrees of freedom
-        df_residual = len(z) - X.shape[1]
-        
-        # Update dispersion parameter
-        psi = rss / df_residual
-        
-        # Update variance components (simplified)
-        new_lambda = lambda_params.copy()
-        new_lambda[0] = psi
-        
-        if len(u) > 0:
-            # Simple update for random effect variances
-            n_penalties = len(design_info['penalty_matrices'])
-            block_sizes = [P.shape[0] for P in design_info['penalty_matrices']]
-            
-            start_idx = 0
-            for i, block_size in enumerate(block_sizes):
-                u_block = u[start_idx:start_idx + block_size]
-                penalty = design_info['penalty_matrices'][i]
-                
-                # Variance component estimate
-                quadratic_form = u_block.T @ penalty @ u_block
-                effective_df = block_size  # Simplified
-                
-                if effective_df > 0:
-                    new_lambda[i + 1] = max(quadratic_form / effective_df, 1e-8)
-                
-                start_idx += block_size
-        
-        return new_lambda
-    
-    def _compute_deviance(self, y, mu, w):
-        """Compute model deviance."""
-        return self.family.deviance(y, mu, w)
-    
-    def _store_results(self, design_info, beta, u, lambda_params, mu, deviance, n_iter):
-        """Store model fitting results."""
-        # Store design matrices for component decomposition
-        self._design_info = design_info
-        self._beta = beta
-        self._u = u
-
-        # Fitted values for all observations
-        self.fitted_values = np.full(len(self.data), np.nan)
-        self.fitted_values[self.valid_obs] = mu
-
-        # Decompose fitted values into components
-        self._decompose_fitted_components(design_info, beta, u)
-
-        # Residuals
-        y_full = self.data[self.response].values
-        self.residuals = np.full(len(self.data), np.nan)
-        valid_idx = self.valid_obs & ~pd.isnull(y_full)
-        self.residuals[valid_idx] = (y_full[valid_idx] - self.fitted_values[valid_idx])
-
-        # Coefficients
-        self.coefficients = np.concatenate([beta, u])
-
-        # Variance components
-        self.var_comp = {f'component_{i}': lambda_params[i+1]
-                        for i in range(len(lambda_params)-1)}
-        self.psi = lambda_params[0]
-
-        # Model information
-        self.deviance = deviance
-        self.n_iterations = n_iter
-        self.n_obs = self.n_obs
-
-        # Store genotype counts for heritability calculation
-        self._n_geno = design_info.get('n_geno_fixed') or design_info.get('n_geno_random')
-
-        # Effective dimensions (simplified)
-        self.effective_dim = {
-            'fixed': design_info['X'].shape[1],
-            'spatial': len(design_info['penalty_matrices'][0].data) if design_info['penalty_matrices'] else 0
-        }
-
-        # Calculate genotype effective dimension for fixed genotypes
-        if design_info.get('n_geno_fixed') is not None:
-            # For fixed genotypes, ED_geno equals number of genotype parameters
-            # which is n_geno - 1 (drop_first=True in dummy coding) plus intercept contribution
-            # Simplification: ED_geno ≈ n_geno - 1
-            self._ED_geno = design_info['n_geno_fixed'] - 1
+        missing = [c for c in required if c not in data]
+        if missing:
+            raise ValueError(f"Missing columns in data: {missing}")
+        if not data.columns.is_unique:
+            raise ValueError("Data column names must be unique")
+        self.weights = self._vector(weights, 1, "weights", data)
+        self.offset = self._vector(offset, 0, "offset", data)
+        if np.any(self.weights < 0):
+            raise ValueError("weights must be nonnegative")
+        predictors = [c for c in required if c != response]
+        valid = ~data[predictors].isna().any(axis=1).to_numpy()
+        for c in [self.spec.x, self.spec.y] + [
+            c for c in self.fixed if pd.api.types.is_numeric_dtype(data[c])
+        ]:
+            vals = pd.to_numeric(data[c], errors="raise").to_numpy(
+                dtype=float, na_value=np.nan
+            )
+            if np.isinf(vals).any():
+                raise ValueError(f"Column {c!r} contains infinite values")
+        self.valid_obs = valid
+        y_all = pd.to_numeric(data[response], errors="raise").to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        if np.isinf(y_all).any():
+            raise ValueError("Response contains infinite values")
+        observed = valid & np.isfinite(y_all) & (self.weights > 0)
+        self.observed = observed
+        self.n_obs = int(observed.sum())
+        if not self.n_obs:
+            raise ValueError(
+                "No observations have complete predictors, response and positive weight"
+            )
+        y = y_all[observed]
+        if self.family.family == "poisson" and (
+            np.any(y < 0) or np.any(y != np.floor(y))
+        ):
+            raise ValueError("Poisson responses must be nonnegative integer counts")
+        if self.family.family == "binomial" and np.any((y < 0) | (y > 1)):
+            raise ValueError(
+                "Binomial responses must be in [0, 1]; use weights for trial counts"
+            )
+        complete = data.loc[valid]
+        self._basis = SpatialBasis(
+            complete[self.spec.x].to_numpy(float),
+            complete[self.spec.y].to_numpy(float),
+            self.spec,
+            observed[valid],
+        )
+        self._encoding = {}
+        for c in list(dict.fromkeys([genotype] + self.fixed + self.random)):
+            categorical = (
+                c == genotype
+                or c in self.random
+                or not pd.api.types.is_numeric_dtype(data[c])
+            )
+            if categorical:
+                levels = list(pd.unique(data.loc[observed, c]))
+                try:
+                    levels.sort()
+                except TypeError:
+                    pass
+                unseen = set(complete[c]) - set(levels)
+                if unseen:
+                    warnings.warn(
+                        f"{c!r} has levels without observed responses; their plots receive NaN predictions: {unseen}",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    valid &= data[c].isin(levels).to_numpy()
+                self._encoding[c] = levels
+        self.valid_obs = valid
+        complete = data.loc[valid]
+        self._genotype_levels = self._encoding[genotype]
+        self._populations = None
+        if geno_decomp:
+            pairs = complete[[genotype, geno_decomp]].drop_duplicates()
+            if pairs[genotype].duplicated().any():
+                raise ValueError(
+                    "Each genotype must belong to one geno_decomp population"
+                )
+            self._populations = dict(zip(pairs[genotype], pairs[geno_decomp]))
+        X, Z = self._design(complete, training=True)
+        local_obs = observed[valid]
+        Xfit, Zfit = X[local_obs], Z[local_obs]
+        w = self.weights[observed]
+        off = self.offset[observed]
+        self._nominal = {}
+        p = Xfit.shape[1]
+        for name, sl in self._random_slices.items():
+            if not self.genotype_as_random or not (
+                name == self.genotype
+                or (self.geno_decomp and name.startswith(self.genotype + ":"))
+            ):
+                continue
+            block = Zfit[:, sl]
+            counts = block.sum(0)
+            residualized = Xfit - block @ ((block.T @ Xfit) / counts[:, None])
+            tol = (
+                max(Xfit.shape)
+                * np.finfo(float).eps
+                * max(np.linalg.norm(Xfit, 2), 1)
+                * 10
+            )
+            self._nominal[name] = (
+                block.shape[1] + np.linalg.matrix_rank(residualized, tol=tol) - p
+            )
+        self._X, self._Z = X, Z
+        initial = None
+        self.outer_history = []
+        if self.family.family == "gaussian":
+            result = fit_mixed(
+                Xfit,
+                Zfit,
+                y - off,
+                w,
+                self._penalties,
+                self.control,
+                update_dispersion=self.control.update_psi_gauss
+                or self.control.update_psi,
+                genotype_indices=self._genotype_indices,
+            )
+            self.outer_converged = True
         else:
-            self._ED_geno = None
-    
-    def _decompose_fitted_components(self, design_info, beta, u):
-        """Decompose fitted values into fixed, spatial, and other random components."""
-        X = design_info['X']
-        Z = design_info['Z']
-
-        # Convert LinearOperator to dense array if needed
-        if isinstance(Z, LinearOperator) or isinstance(Z, ConcatenatedBlockOperator):
-            n_obs = X.shape[0]
-            n_random = Z.shape[1]
-            Z_dense = np.zeros((n_obs, n_random))
-            for j in range(n_random):
-                e_j = np.zeros(n_random)
-                e_j[j] = 1.0
-                Z_dense[:, j] = Z @ e_j
-            Z = Z_dense
-
-        # Initialize component arrays
-        self.spatial_effects = np.full(len(self.data), np.nan)
-        self.random_effects = np.full(len(self.data), np.nan)
-        self.fixed_effects = np.full(len(self.data), np.nan)
-
-        # Initialize spatial centering adjustment
-        spatial_mean_adjustment = 0.0
-
-        if len(u) > 0 and Z.shape[1] > 0:
-            # Decompose random effects by component
-            penalty_matrices = design_info['penalty_matrices']
-            
-            if penalty_matrices:
-                # First component is typically spatial (2D P-splines)
-                spatial_size = penalty_matrices[0].shape[0]
-                spatial_u = u[:spatial_size]
-                spatial_Z = Z[:, :spatial_size]
-                
-                # Spatial effects component
-                spatial_part = spatial_Z @ spatial_u
-                # Center spatial effects to ensure identifiability (sum-to-zero constraint)
-                spatial_mean_adjustment = np.mean(spatial_part)
-                spatial_part_centered = spatial_part - spatial_mean_adjustment
-                self.spatial_effects[self.valid_obs] = spatial_part_centered
-                
-                # Other random effects (if any)
-                if len(u) > spatial_size:
-                    other_u = u[spatial_size:]
-                    other_Z = Z[:, spatial_size:]
-                    other_part = other_Z @ other_u
-                    self.random_effects[self.valid_obs] = other_part
-                else:
-                    self.random_effects[self.valid_obs] = 0.0
+            if self.family.family == "poisson":
+                mu = y + 0.1
+                eta = np.log(mu)
             else:
-                # No spatial component, all are other random effects
-                random_part = Z @ u
-                self.random_effects[self.valid_obs] = random_part
-                self.spatial_effects[self.valid_obs] = 0.0
-        else:
-            # No random effects
-            self.spatial_effects[self.valid_obs] = 0.0
-            self.random_effects[self.valid_obs] = 0.0
-        
-        # Fixed effects component (adjusted for spatial centering)
-        fixed_part = X @ beta + spatial_mean_adjustment
-        self.fixed_effects[self.valid_obs] = fixed_part
-        
-    def get_BLUEs(self):
-        """
-        Extract genotypic BLUEs (Best Linear Unbiased Estimates).
-        
-        BLUEs represent adjusted genotypic means, calculated as the average of 
-        fitted values for each genotype. This matches the approach used by 
-        R SpATS predict(model, which='genotype').
-        
-        Returns
-        -------
-        pd.Series
-            BLUEs for each genotype
-        """
-        if not hasattr(self, 'fitted_values'):
-            raise ValueError("Model must be fitted before extracting BLUEs")
-        
+                mu = (w * y + 0.5) / (w + 1)
+                eta = np.log(mu / (1 - mu))
+            self.outer_converged = False
+            for outer in range(self.control.max_iter):
+                derivative = np.maximum(self.family.d_inverse_link(eta), 1e-12)
+                variance = np.maximum(self.family.variance(mu), 1e-12)
+                working = eta - off + (y - mu) / derivative
+                working_w = w * derivative**2 / variance
+                result = fit_mixed(
+                    Xfit,
+                    Zfit,
+                    working,
+                    working_w,
+                    self._penalties,
+                    self.control,
+                    initial=initial,
+                    update_dispersion=self.control.update_psi,
+                    genotype_indices=self._genotype_indices,
+                )
+                neweta = (
+                    Xfit @ result.coefficients[:p]
+                    + Zfit @ result.coefficients[p:]
+                    + off
+                )
+                change = np.sum((neweta - eta) ** 2) / max(np.sum(neweta**2), 1e-20)
+                self.outer_history.append(float(change))
+                eta = neweta
+                mu = self.family.inverse_link(eta)
+                initial = result.dispersion, result.variances
+                if change < self.control.tolerance:
+                    self.outer_converged = True
+                    break
+        self._result = result
+        self.coefficients = result.coefficients
+        self.covariance = result.covariance
+        self.psi = result.dispersion
+        self.var_comp = dict(zip(self._variance_names, result.variances))
+        self.effective_dim = {
+            "fixed": float(p),
+            **dict(zip(self._variance_names, result.effective_dimensions)),
+        }
+        self.deviance = result.objective
+        self.n_iterations = len(result.history)
+        self.converged = result.converged and self.outer_converged
+        self.history = pd.DataFrame(result.history)
+        if not self.converged:
+            warnings.warn(
+                "SpATS did not converge; inspect history or increase max_iter",
+                ConvergenceWarning,
+                stacklevel=2,
+            )
+        eta = X @ self.coefficients[:p] + Z @ self.coefficients[p:] + self.offset[valid]
+        self.fitted_values = np.full(len(data), np.nan)
+        self.fitted_values[valid] = self.family.inverse_link(eta)
+        self.residuals = y_all - self.fitted_values
+        self.spatial_trend = np.full(len(data), np.nan)
+        self.spatial_trend[valid] = (
+            X[:, self._spatial_fixed] @ self.coefficients[self._spatial_fixed]
+            + Z[:, : self._spatial_q] @ self.coefficients[p : p + self._spatial_q]
+        )
+        # Center for an interpretable correction, leaving an overall trait level.
+        self.spatial_trend -= np.average(self.spatial_trend[observed], weights=w)
+        self.adjusted_values = (
+            y_all - self.spatial_trend if self.family.family == "gaussian" else None
+        )
+        self.residual_df = self.n_obs - sum(self.effective_dim.values())
+
+    @staticmethod
+    def _terms(terms):
+        if terms is None:
+            return []
+        if isinstance(terms, str):
+            raise TypeError(
+                "fixed/random must be a list of column names, not a formula string"
+            )
+        terms = list(terms)
+        if len(set(terms)) != len(terms):
+            raise ValueError("Duplicate model terms")
+        return terms
+
+    @staticmethod
+    def _vector(value, default, name, data):
+        if isinstance(value, str):
+            value = data[value]
+        a = np.asarray(default if value is None else value, dtype=float)
+        if a.ndim == 0:
+            a = np.full(len(data), a)
+        if a.shape != (len(data),) or not np.isfinite(a).all():
+            raise ValueError(
+                f"{name} must be finite and have one value per input row (or be scalar)"
+            )
+        return a.copy()
+
+    def _encode(self, data, name, drop=False):
+        if name not in self._encoding:
+            return data[name].to_numpy(dtype=float).reshape(-1, 1)
+        levels = self._encoding[name]
+        if not data[name].isin(levels).all():
+            raise ValueError(
+                f"Missing or unseen levels in {name!r}; predictions require fitted levels"
+            )
+        codes = pd.Index(levels).get_indexer(data[name].astype(object))
+        if np.any(codes < 0):
+            raise ValueError(
+                f"Missing or unseen levels in {name!r}; predictions require fitted levels"
+            )
+        out = np.zeros((len(data), len(levels)))
+        out[np.arange(len(data)), codes] = 1
+        return out[:, 1:] if drop else out
+
+    def _design(self, data, training=False):
+        sx, sz = self._basis.evaluate(
+            data[self.spec.x].to_numpy(float), data[self.spec.y].to_numpy(float)
+        )
+        # Full genotype indicators when fixed match R's identifiable parameterization.
         if self.genotype_as_random:
-            raise ValueError("BLUEs are only available when genotype is treated as fixed effect")
-        
-        # Calculate BLUEs as fitted genotype means
-        blues = {}
-        
-        for genotype in self.data[self.genotype].unique():
-            # Find observations for this genotype
-            geno_mask = (self.data[self.genotype] == genotype) & self.valid_obs
-            
-            if np.any(geno_mask):
-                # BLUE = mean of fitted values for this genotype
-                blues[genotype] = np.mean(self.fitted_values[geno_mask])
-        
-        return pd.Series(blues)
-    
-    
-    def predict(self, newdata=None):
-        """
-        Make predictions from fitted model.
+            parts = [np.ones((len(data), 1))]
+            names = ["Intercept"]
+        else:
+            parts = [self._encode(data, self.genotype)]
+            names = [f"{self.genotype}[{g}]" for g in self._genotype_levels]
+        for c in self.fixed:
+            part = self._encode(data, c, drop=True)
+            parts.append(part)
+            names += (
+                [f"{c}[{v}]" for v in self._encoding[c][1:]]
+                if c in self._encoding
+                else [c]
+            )
+        start = sum(v.shape[1] for v in parts)
+        parts.append(sx)
+        names += [f"spatial_polynomial_{i + 1}" for i in range(sx.shape[1])]
+        X = np.column_stack(parts)
+        zs = [sz]
+        random_slices = {}
+        k = sz.shape[1]
+        extra = []
+        if self.genotype_as_random:
+            geno = self._encode(data, self.genotype)
+            if self._populations:
+                populations = list(
+                    dict.fromkeys(self._populations[g] for g in self._genotype_levels)
+                )
+                for pop in populations:
+                    cols = [
+                        i
+                        for i, g in enumerate(self._genotype_levels)
+                        if self._populations[g] == pop
+                    ]
+                    extra.append((f"{self.genotype}:{pop}", geno[:, cols]))
+            else:
+                extra.append((self.genotype, geno))
+        extra += [(c, self._encode(data, c)) for c in self.random]
+        if len({name for name, _ in extra}) != len(extra):
+            raise ValueError("Random terms duplicate genotype or population terms")
+        for name, block in extra:
+            zs.append(block)
+            random_slices[name] = slice(k, k + block.shape[1])
+            k += block.shape[1]
+        Z = np.column_stack(zs)
+        if training:
+            if not self.genotype_as_random:
+                self._genotype_indices = np.arange(len(self._genotype_levels))
+            else:
+                self._genotype_indices = (
+                    X.shape[1] + sz.shape[1] + np.arange(len(self._genotype_levels))
+                )
+            self._spatial_fixed = slice(start, X.shape[1])
+            self._spatial_q = sz.shape[1]
+            self._random_slices = random_slices
+            self._fixed_names = names
+            ns = len(self._basis.names)
+            self._variance_names = self._basis.names + list(random_slices)
+            if len(set(self._variance_names)) != len(self._variance_names):
+                raise ValueError(
+                    "Model term names collide with reserved spatial component names"
+                )
+            self._penalties = np.zeros((ns + len(random_slices), k))
+            self._penalties[:ns, : sz.shape[1]] = self._basis.penalties
+            for i, sl in enumerate(random_slices.values(), ns):
+                self._penalties[i, sl] = 1
+        return X, Z
 
-        Parameters
-        ----------
-        newdata : pd.DataFrame, optional
-            New data for prediction. If None, returns fitted values.
+    def predict(
+        self,
+        newdata: pd.DataFrame | None = None,
+        *,
+        offset=None,
+        return_se: bool = False,
+    ) -> np.ndarray | pd.DataFrame:
+        """Predict plot means using training knots, contrasts and level ordering.
 
-        Returns
-        -------
-        np.ndarray
-            Predicted values
+        New-data offsets default to zero; supply them explicitly if applicable.
+        Unseen factor levels and coordinates outside the field raise errors.
+        SE describes the latent predictor (link scale), not a future observation.
         """
         if newdata is None:
-            return self.fitted_values
+            if not return_se:
+                return self.fitted_values.copy()
+            A = np.column_stack((self._X, self._Z))
+            se = np.full(len(self.data), np.nan)
+            se[self.valid_obs] = np.sqrt(
+                np.maximum(np.einsum("ij,jk,ik->i", A, self.covariance, A), 0)
+            )
+            return pd.DataFrame(
+                {"predicted": self.fitted_values, "se_link": se}, index=self.data.index
+            )
+        X, Z = self._design(newdata)
+        A = np.column_stack((X, Z))
+        off = self._vector(offset, 0, "offset", newdata)
+        pred = self.family.inverse_link(A @ self.coefficients + off)
+        if return_se:
+            se = np.sqrt(np.maximum(np.einsum("ij,jk,ik->i", A, self.covariance, A), 0))
+            return pd.DataFrame({"predicted": pred, "se_link": se}, index=newdata.index)
+        return pred
 
-        # For new data prediction, would need to reconstruct design matrices
-        # This is a simplified implementation
-        raise NotImplementedError("Prediction on new data not yet implemented")
+    def genotype_predictions(self) -> pd.DataFrame:
+        """Genotype effects and conditional SEs on the link scale.
 
-    def get_heritability(self, mode: str = "generalized") -> float:
+        Fixed genotypes: coefficient at zero values of the other model columns.
+        Random genotypes: zero-centered BLUP, excluding the intercept. These
+        are effects, not marginal means averaged over treatments or locations.
         """
-        Calculate heritability from genotype effective dimension.
+        if not self.genotype_as_random:
+            indices = np.arange(len(self._genotype_levels))
+            levels = self._genotype_levels
+        else:
+            indices, levels = [], []
+            p = self._X.shape[1]
+            if self._populations:
+                for name, sl in self._random_slices.items():
+                    if not name.startswith(self.genotype + ":"):
+                        continue
+                    pop_levels = [
+                        g
+                        for g in self._genotype_levels
+                        if f"{self.genotype}:{self._populations[g]}" == name
+                    ]
+                    levels.extend(pop_levels)
+                    indices.extend(range(p + sl.start, p + sl.stop))
+            else:
+                sl = self._random_slices[self.genotype]
+                indices = np.arange(p + sl.start, p + sl.stop)
+                levels = self._genotype_levels
+        indices = np.asarray(indices, dtype=int)
+        return pd.DataFrame(
+            {
+                self.genotype: levels,
+                "effect": self.coefficients[indices],
+                "se": np.sqrt(np.maximum(np.diag(self.covariance)[indices], 0)),
+                "type": "BLUP" if self.genotype_as_random else "BLUE",
+            }
+        )
 
-        Default heritability follows SpATS generalized H² = ED_geno / n_geno.
-        For comparison with older results, set mode='classical' to compute
-        ED_geno / (n_geno - 1).
+    def get_heritability(self) -> float | dict[str, float]:
+        """Generalized H² = genotype effective dimension / estimable dimension.
 
-        Parameters
-        ----------
-        mode : {"generalized", "classical"}, default="generalized"
-            - "generalized": ED_geno / n_geno       (SpATS-style generalized H²)
-            - "classical"  : ED_geno / (n_geno - 1) (legacy)
-
-        Returns
-        -------
-        float
-            Heritability estimate
-
-        Raises
-        ------
-        ValueError
-            If genotype is not treated as fixed effect or model is not fitted
-
-        Examples
-        --------
-        >>> model = SpATS(response='yield', genotype='geno', spatial=('col','row'), data=data)
-        >>> h2 = model.get_heritability()  # generalized (default)
-        >>> h2_classical = model.get_heritability(mode='classical')  # legacy
+        Requires random genotypes. Estimable dimension is rank([X,Zg])-rank(X),
+        as in R, accounting for confounding with all fixed effects. This is
+        trial-specific generalized heritability, not a universal genetic trait.
         """
-        if not hasattr(self, '_ED_geno') or self._ED_geno is None:
-            raise ValueError("Heritability is only available when genotype is treated as fixed effect")
-
-        if not hasattr(self, '_n_geno') or self._n_geno is None:
-            raise ValueError("Model must be fitted before calculating heritability")
-
-        from .utils import get_heritability
-        return get_heritability(self._ED_geno, self._n_geno, mode=mode)
+        if not self.genotype_as_random:
+            raise ValueError("Heritability requires genotype_as_random=True")
+        names = [
+            n
+            for n in self._random_slices
+            if n == self.genotype
+            or (self.geno_decomp and n.startswith(self.genotype + ":"))
+        ]
+        values = {}
+        for name in names:
+            nominal = self._nominal[name]
+            if nominal == 0:
+                raise ValueError(f"Heritability is not identifiable for {name}")
+            values[name] = self.effective_dim[name] / nominal
+        return values if self.geno_decomp else values[self.genotype]
 
     @property
-    def heritability(self) -> float:
+    def heritability(self):
+        return self.get_heritability()
+
+    def to_frame(self) -> pd.DataFrame:
+        """Original plots plus fitted, residual, spatial trend, adjusted and used columns.
+
+        ``adjusted`` removes only the centered spatial trend; it retains
+        treatment, block, genotype and residual contributions.
         """
-        Heritability estimate using generalized method (H² = ED_geno / n_geno).
+        result = self.data.assign(
+            fitted=self.fitted_values,
+            residual=self.residuals,
+            spatial_trend=self.spatial_trend,
+            used_for_fit=self.observed,
+        )
+        if self.adjusted_values is not None:
+            result["adjusted"] = self.adjusted_values
+        return result
 
-        For classical heritability (ED_geno / (n_geno - 1)), use:
-        model.get_heritability(mode='classical')
-
-        Returns
-        -------
-        float
-            Generalized heritability estimate
-
-        Raises
-        ------
-        ValueError
-            If genotype is not treated as fixed effect or model is not fitted
-        """
-        return self.get_heritability(mode="generalized")
-    
-    def summary(self, which="dimensions"):
-        """
-        Print model summary.
-
-        Parameters
-        ----------
-        which : str
-            Type of summary: "dimensions", "variances", or "all"
-        """
-        print(f"SpATS Model Summary")
-        print("=" * 50)
-        print(f"Response: {self.response}")
-        print(f"Observations: {self.n_obs}")
-        print(f"Deviance: {self.deviance:.4f}")
-        print(f"Iterations: {self.n_iterations}")
-
-        if which in ["dimensions", "all"]:
-            print("\nModel Dimensions:")
-            for component, dim in self.effective_dim.items():
-                print(f"  {component}: {dim}")
-
-        if which in ["variances", "all"]:
-            print("\nVariance Components:")
-            print(f"  Dispersion (psi): {self.psi:.6f}")
-            for component, var in self.var_comp.items():
-                print(f"  {component}: {var:.6f}")
+    def summary(self, which: str = "all") -> pd.DataFrame:
+        """Return a table suitable for logs, notebooks and CSV export."""
+        table = pd.DataFrame(
+            {
+                "variance": self.var_comp,
+                "effective_dimension": {
+                    k: v for k, v in self.effective_dim.items() if k != "fixed"
+                },
+            }
+        )
+        table.attrs.update(
+            converged=self.converged,
+            n_obs=self.n_obs,
+            dispersion=self.psi,
+            iterations=self.n_iterations,
+            residual_df=self.residual_df,
+        )
+        return table
 
     def summary_ed(self):
-        """
-        Print effective dimension (ED) summary for all model components.
+        return pd.Series(self.effective_dim, name="effective_dimension")
 
-        Effective dimensions quantify the "amount of smoothing" or complexity
-        consumed by each random effect. For spatial smooths in PS-ANOVA:
-        - row_smooth: ED for row-wise spatial trend
-        - col_smooth: ED for column-wise spatial trend
-        - interaction_smooth: ED for 2D spatial interaction (non-separable pattern)
+    def plot(self, show=True, figsize=(12, 8), **kwargs):
+        """Plot observed, fitted, spatial trend and residual values at plot coordinates."""
+        import matplotlib.pyplot as plt
 
-        Higher ED indicates less smoothing (more model flexibility), while
-        lower ED indicates more aggressive smoothing (simpler surface).
-
-        Note: Current implementation uses nominal dimensions as approximations.
-        For exact CHOLMOD-based EDs, use the REML optimizer path.
-
-        Examples
-        --------
-        >>> model = SpATS(response='yield', genotype='geno', spatial=('col','row'), data=data)
-        >>> model.summary_ed()
-        """
-        print("SpATS Effective Dimension Summary")
-        print("=" * 60)
-        print(f"Response: {self.response}")
-        print(f"Observations: {self.n_obs}")
-        print()
-
-        if hasattr(self, 'effective_dim') and self.effective_dim:
-            print("Effective Dimensions:")
-            print("-" * 60)
-
-            # Fixed effects
-            if 'fixed' in self.effective_dim:
-                print(f"  Fixed effects:                    {self.effective_dim['fixed']:>8.2f}")
-
-            # Spatial components (from block_info if available)
-            if hasattr(self, '_design_info') and 'block_info' in self._design_info:
-                blocks = self._design_info['block_info']
-                for block in blocks:
-                    # Use block size as nominal dimension approximation
-                    ed_approx = block.size
-                    print(f"  {block.name:30s}  {ed_approx:>8.2f} (nominal)")
-            elif 'spatial' in self.effective_dim:
-                print(f"  Spatial effects:                  {self.effective_dim['spatial']:>8.2f}")
-
-            # Genotype
-            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
-                print(f"  Genotype:                         {self._ED_geno:>8.2f}")
-
-            print("-" * 60)
-
-            # Total model ED (approximate)
-            total_ed = sum(self.effective_dim.values())
-            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
-                total_ed += self._ED_geno
-            print(f"  Total model ED (approx):          {total_ed:>8.2f}")
-
-            # Residual ED estimate
-            ed_resid = self.n_obs - total_ed
-            print(f"  Residual ED (approx):             {ed_resid:>8.2f}")
-            print()
-
-            # Show percentage breakdown
-            print("Percentage of degrees of freedom:")
-            print("-" * 60)
-            if 'fixed' in self.effective_dim:
-                pct_fixed = 100.0 * self.effective_dim['fixed'] / self.n_obs
-                print(f"  Fixed effects:                    {pct_fixed:>7.2f}%")
-
-            if hasattr(self, '_design_info') and 'block_info' in self._design_info:
-                blocks = self._design_info['block_info']
-                for block in blocks:
-                    pct_block = 100.0 * block.size / self.n_obs
-                    print(f"  {block.name:30s}  {pct_block:>7.2f}%")
-            elif 'spatial' in self.effective_dim:
-                pct_spatial = 100.0 * self.effective_dim['spatial'] / self.n_obs
-                print(f"  Spatial effects:                  {pct_spatial:>7.2f}%")
-
-            if hasattr(self, '_ED_geno') and self._ED_geno is not None:
-                pct_geno = 100.0 * self._ED_geno / self.n_obs
-                print(f"  Genotype:                         {pct_geno:>7.2f}%")
-
-            pct_resid = 100.0 * ed_resid / self.n_obs
-            print(f"  Residual:                         {pct_resid:>7.2f}%")
-            print()
-        else:
-            print("No effective dimension information available.")
-            print("Model may not have been fitted yet.")
-            print()
-
-        print("Note: EDs shown are nominal dimensions (parameter counts).")
-        print("For exact EDs accounting for smoothing penalties, use REML optimizer.")
-    
-    def plot(self, all_in_one: bool = True, figsize: Tuple[int, int] = (15, 10), 
-             show: bool = True, spa_trend: str = 'raw'):
-        """
-        Plot SpATS model results with 6 diagnostic panels (matching R SpATS behavior).
-        
-        Creates the following plots:
-        1. Raw data
-        2. Fitted data  
-        3. Residuals
-        4. Spatial trend
-        5. Genotypic predictions (BLUPs/BLUEs)
-        6. Histogram of genotype coefficients
-        
-        Parameters
-        ----------
-        all_in_one : bool, default=True
-            Whether to show all plots in one figure
-        figsize : tuple, default=(15, 10)
-            Figure size
-        show : bool, default=True
-            Whether to display the plot window
-        spa_trend : str, default='raw'
-            Format for spatial trend: 'raw' or 'percentage'
-            
-        Returns
-        -------
-        plt.Figure
-            Matplotlib figure object
-        """
-        fig = plotting.plot_spats_full(self, all_in_one=all_in_one, figsize=figsize, 
-                                       spa_trend=spa_trend)
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        for ax, values, label in zip(
+            axes.flat,
+            [
+                self.data[self.response],
+                self.fitted_values,
+                self.spatial_trend,
+                self.residuals,
+            ],
+            ["Observed", "Fitted", "Spatial trend", "Residual"],
+        ):
+            scatter = ax.scatter(
+                self.data[self.spec.x], self.data[self.spec.y], c=values, marker="s"
+            )
+            ax.set(xlabel=self.spec.x, ylabel=self.spec.y, title=label)
+            fig.colorbar(scatter, ax=ax)
+        fig.tight_layout()
         if show:
-            import matplotlib.pyplot as plt
             plt.show()
         return fig
-    
-    def plot_spatial(self, figsize: Tuple[int, int] = (10, 6), show: bool = True):
-        """Plot spatial trend only."""
-        fig = plotting._plot_spatial_trend(self, figsize)
-        if show:
-            import matplotlib.pyplot as plt
-            plt.show()
-        return fig
-    
-    def plot_residuals(self, figsize: Tuple[int, int] = (10, 6), show: bool = True):
-        """Plot residuals vs fitted values."""
-        fig = plotting._plot_residuals(self, figsize)
-        if show:
-            import matplotlib.pyplot as plt
-            plt.show()
-        return fig
-    
-    def plot_fitted(self, figsize: Tuple[int, int] = (10, 6), show: bool = True):
-        """Plot fitted vs observed values."""
-        fig = plotting._plot_fitted_vs_observed(self, figsize)
-        if show:
-            import matplotlib.pyplot as plt
-            plt.show()
-        return fig
-    
+
     def __repr__(self):
-        """String representation of SpATS model."""
-        return (f"SpATS(response='{self.response}', genotype='{self.genotype}', "
-                f"n_obs={self.n_obs}, deviance={self.deviance:.4f})")
+        return (
+            f"SpATS(response={self.response!r}, genotype={self.genotype!r}, "
+            f"n_obs={self.n_obs}, converged={self.converged}, iterations={self.n_iterations})"
+        )
+
+
+def fit_trial(
+    *,
+    data: pd.DataFrame,
+    response: str,
+    genotype: str,
+    spatial: SpatialSpec | tuple[str, str] | dict,
+    **kwargs,
+) -> SpATS:
+    """Fit one trial; keyword-only entry point returning a :class:`SpATS` result."""
+    return SpATS(
+        response=response, genotype=genotype, spatial=spatial, data=data, **kwargs
+    )
